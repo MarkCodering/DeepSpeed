@@ -1,0 +1,75 @@
+# DeepSpeed Configuration
+# Optimized defaults for M2 Mac with 8GB RAM
+
+[general]
+# How often to sample system metrics (seconds)
+monitor_interval_secs = 30
+
+# How often to run AI analysis (seconds)
+ai_interval_secs = 300
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# Log file location (leave empty to use ~/Library/Logs/deepspeed.log)
+log_file = ""
+
+# Send macOS notifications for important events
+notifications_enabled = true
+
+[thresholds]
+# Memory used % that triggers rule-based actions
+memory_warning_pct = 80.0
+memory_critical_pct = 90.0
+
+# Swap used % that triggers aggressive optimization
+swap_warning_pct = 40.0
+swap_critical_pct = 70.0
+
+# CPU % sustained for cpu_sustained_secs before flagging
+cpu_warning_pct = 85.0
+cpu_sustained_secs = 60
+
+# Process memory (MB) above which a process is considered heavy
+process_heavy_memory_mb = 500
+
+[actions]
+# Purge macOS disk cache when memory is critical (runs: sudo purge)
+# Note: requires passwordless sudo for purge, or run daemon as root
+allow_purge_cache = false
+
+# Renice heavy non-system processes to lower priority (nice +10)
+allow_renice = true
+
+# Maximum nice value to apply (10 = slightly lower, 19 = lowest)
+renice_value = 10
+
+# Processes to never touch (besides system processes)
+protected_processes = [
+    "Finder",
+    "WindowServer",
+    "loginwindow",
+    "SystemUIServer",
+    "Dock",
+    "deepspeed",
+]
+
+# Minimum process age (seconds) before considering it for renice
+min_process_age_secs = 120
+
+[ai]
+# Your Anthropic API key - or set ANTHROPIC_API_KEY env var
+# Leave empty to run in rule-only mode (no AI)
+api_key = ""
+
+# Claude model to use
+model = "claude-haiku-4-5-20251001"
+
+# Max tokens for AI response
+max_tokens = 1024
+
+# Only apply AI actions if confidence score >= this value (0.0-1.0)
+min_confidence = 0.75
+
+# Cooldown between applying the same AI recommendation (seconds)
+action_cooldown_secs = 600
