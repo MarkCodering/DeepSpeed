@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit these
+.env
+*.env
+**/*secret*
+**/*credentials*
+**/*api_key*
+
+# Config with personal data (template is tracked, user copy is not)
+# The template at config/deepspeed.toml IS tracked.
+# The installed copy at ~/.config/deepspeed/ is outside the repo.
+
+# Logs
+*.log
+logs/
+
+# OS-specific
+.DS_Store
+desktop.ini

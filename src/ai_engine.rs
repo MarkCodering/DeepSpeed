@@ -205,7 +205,7 @@ Respond ONLY with valid JSON matching this schema — no markdown, no extra text
         format!(
             "System state at {}:\n\
              Memory: {:.1}% used ({}/{}MB, {}MB free)\n\
-             Wired: {}MB, Compressed: {}MB\n\
+             Kernel/wired: {}MB, Compressed/cached: {}MB\n\
              Swap: {:.1}% ({}/{}MB)\n\
              CPU: {:.1}% ({} cores)\n\
              Memory pressure: {:?}\n\
@@ -218,8 +218,8 @@ Respond ONLY with valid JSON matching this schema — no markdown, no extra text
             snap.memory.used_mb,
             snap.memory.total_mb,
             snap.memory.available_mb,
-            snap.memory.wired_mb,
-            snap.memory.compressed_mb,
+            snap.memory.kernel_mb,
+            snap.memory.cached_mb,
             snap.swap.used_pct,
             snap.swap.used_mb,
             snap.swap.total_mb,
