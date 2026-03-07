@@ -34,83 +34,222 @@ impl ActionExecutor {
         }
     }
 
+    // ── Renice / priority lowering ─────────────────────────────────────────
+
     fn renice(&self, pid: u32, name: &str, nice: i32) -> Result<bool> {
         if !self.config.actions.allow_renice {
             return Ok(false);
         }
-
-        info!("Renicing process {} (pid {}) to nice={}", name, pid, nice);
-        let status = Command::new("renice")
-            .args([nice.to_string().as_str(), "-p", &pid.to_string()])
-            .status()?;
-
-        if status.success() {
-            info!("Reniced {} (pid {}) to nice={}", name, pid, nice);
-            Ok(true)
-        } else {
-            warn!("Failed to renice {} (pid {})", name, pid);
-            Ok(false)
-        }
+        info!("Lowering priority of '{}' (pid {})", name, pid);
+        renice_process(pid, name, nice)
     }
+
+    // ── Cache purge ────────────────────────────────────────────────────────
 
     fn purge_cache(&self) -> Result<bool> {
         if !self.config.actions.allow_purge_cache {
             warn!("Cache purge requested but disabled in config (allow_purge_cache = false)");
             return Ok(false);
         }
-        info!("Purging disk cache");
-        let status = Command::new("purge").status()?;
-        Ok(status.success())
+        purge_cache_impl()
     }
 
     fn kill_process(&self, pid: u32, name: &str) -> Result<bool> {
-        warn!("Kill requested for {} (pid {}), skipping — not auto-killing processes", name, pid);
-        // We never auto-kill; only notify the user
+        warn!("Kill requested for '{}' (pid {}) — skipping, DeepSpeed never auto-kills", name, pid);
         Ok(false)
     }
+
+    // ── Notifications ──────────────────────────────────────────────────────
 
     pub fn send_notification(&self, title: &str, message: &str) {
         if !self.config.general.notifications_enabled {
             return;
         }
-        let script = format!(
-            "display notification \"{}\" with title \"DeepSpeed\" subtitle \"{}\"",
-            message.replace('"', "'"),
-            title.replace('"', "'"),
-        );
-        if let Err(e) = Command::new("osascript").args(["-e", &script]).status() {
-            warn!("Failed to send notification: {}", e);
+        send_notification_impl(title, message);
+    }
+}
+
+// ── Platform-specific: renice ──────────────────────────────────────────────
+
+#[cfg(unix)]
+fn renice_process(pid: u32, name: &str, nice: i32) -> Result<bool> {
+    let status = Command::new("renice")
+        .args([nice.to_string().as_str(), "-p", &pid.to_string()])
+        .status()?;
+    if status.success() {
+        info!("Reniced '{}' (pid {}) to nice={}", name, pid, nice);
+        Ok(true)
+    } else {
+        warn!("renice failed for '{}' (pid {})", name, pid);
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn renice_process(pid: u32, name: &str, nice: i32) -> Result<bool> {
+    // Map Unix nice value to Windows priority class
+    let priority_class = if nice >= 10 { "Idle" } else { "BelowNormal" };
+    let script = format!(
+        "(Get-Process -Id {pid}).PriorityClass = '{cls}'",
+        pid = pid,
+        cls = priority_class,
+    );
+    let status = Command::new("powershell")
+        .args(["-NonInteractive", "-Command", &script])
+        .status()?;
+    if status.success() {
+        info!("Set '{}' (pid {}) priority to {}", name, pid, priority_class);
+        Ok(true)
+    } else {
+        warn!("Failed to set priority for '{}' (pid {})", name, pid);
+        Ok(false)
+    }
+}
+
+// ── Platform-specific: cache purge ────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn purge_cache_impl() -> Result<bool> {
+    info!("Purging disk cache (macOS purge)");
+    let status = Command::new("purge").status()?;
+    Ok(status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn purge_cache_impl() -> Result<bool> {
+    // Requires root or passwordless sudo for tee /proc/sys/vm/drop_caches
+    info!("Dropping page cache (Linux)");
+    let sync_ok = Command::new("sync").status().map(|s| s.success()).unwrap_or(false);
+    if !sync_ok {
+        warn!("sync failed before drop_caches");
+    }
+    let status = Command::new("sudo")
+        .args(["tee", "/proc/sys/vm/drop_caches"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(b"3")?;
+            }
+            child.wait()
+        });
+    match status {
+        Ok(s) if s.success() => Ok(true),
+        _ => {
+            warn!("drop_caches failed — ensure passwordless sudo for tee /proc/sys/vm/drop_caches");
+            Ok(false)
         }
     }
 }
 
-/// Determine if a process should be protected from any action
-pub fn is_protected(name: &str, protected: &[String]) -> bool {
-    // Always protect core system processes
-    let always_protected = [
-        "kernel_task",
-        "launchd",
-        "WindowServer",
-        "loginwindow",
-        "SystemUIServer",
-        "Dock",
-        "Finder",
-        "coreaudiod",
-        "bluetoothd",
-        "configd",
-        "notifyd",
-        "deepspeed",
-        "mds",
-        "mds_stores",
-    ];
+#[cfg(target_os = "windows")]
+fn purge_cache_impl() -> Result<bool> {
+    warn!("Cache purge not supported on Windows");
+    Ok(false)
+}
 
-    if always_protected.iter().any(|p| name.eq_ignore_ascii_case(p)) {
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn purge_cache_impl() -> Result<bool> {
+    warn!("Cache purge not supported on this platform");
+    Ok(false)
+}
+
+// ── Platform-specific: notifications ──────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn send_notification_impl(title: &str, message: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"DeepSpeed\" subtitle \"{}\"",
+        message.replace('"', "'"),
+        title.replace('"', "'"),
+    );
+    if let Err(e) = Command::new("osascript").args(["-e", &script]).status() {
+        warn!("Failed to send macOS notification: {}", e);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_notification_impl(title: &str, message: &str) {
+    // notify-send is part of libnotify-bin; falls back silently if not installed
+    if let Err(e) = Command::new("notify-send")
+        .args(["--app-name=DeepSpeed", "--urgency=normal", title, message])
+        .status()
+    {
+        warn!("Failed to send Linux notification (is notify-send installed?): {}", e);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn send_notification_impl(title: &str, message: &str) {
+    let title = title.replace('\'', "\"");
+    let message = message.replace('\'', "\"");
+    let script = format!(
+        r#"
+        Add-Type -AssemblyName System.Windows.Forms
+        $n = New-Object System.Windows.Forms.NotifyIcon
+        $n.Icon = [System.Drawing.SystemIcons]::Information
+        $n.BalloonTipTitle = '{title}'
+        $n.BalloonTipText  = '{message}'
+        $n.Visible = $true
+        $n.ShowBalloonTip(5000)
+        Start-Sleep -Seconds 6
+        $n.Dispose()
+        "#,
+        title = title,
+        message = message,
+    );
+    if let Err(e) = Command::new("powershell")
+        .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .spawn()
+    {
+        warn!("Failed to send Windows notification: {}", e);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn send_notification_impl(title: &str, message: &str) {
+    info!("Notification [{}]: {}", title, message);
+}
+
+// ── Protected process lists ────────────────────────────────────────────────
+
+pub fn is_protected(name: &str, protected: &[String]) -> bool {
+    if always_protected_system(name) {
         return true;
     }
     protected.iter().any(|p| name.eq_ignore_ascii_case(p))
 }
 
-/// Pick the best candidate processes to renice
+fn always_protected_system(name: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let list = &[
+        "kernel_task", "launchd", "WindowServer", "loginwindow",
+        "SystemUIServer", "Dock", "Finder", "coreaudiod", "bluetoothd",
+        "configd", "notifyd", "deepspeed", "mds", "mds_stores",
+        "com.apple.WebKit.WebContent", "com.apple.WebKit.Networking",
+    ];
+
+    #[cfg(target_os = "linux")]
+    let list = &[
+        "systemd", "kthreadd", "init", "dbus-daemon", "NetworkManager",
+        "polkitd", "deepspeed", "Xorg", "gnome-shell", "plasmashell",
+        "pipewire", "wireplumber", "pulseaudio",
+    ];
+
+    #[cfg(target_os = "windows")]
+    let list = &[
+        "System", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+        "lsass.exe", "winlogon.exe", "explorer.exe", "deepspeed.exe",
+        "svchost.exe", "dwm.exe", "audiodg.exe",
+    ];
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let list: &[&str] = &["deepspeed"];
+
+    list.iter().any(|p| name.eq_ignore_ascii_case(p))
+}
+
 pub fn select_renice_candidates(
     processes: &[ProcessInfo],
     heavy_threshold_mb: u64,

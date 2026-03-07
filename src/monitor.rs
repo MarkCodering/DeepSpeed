@@ -1,7 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use sysinfo::System;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,10 +20,10 @@ pub struct MemoryInfo {
     pub used_mb: u64,
     pub available_mb: u64,
     pub used_pct: f64,
-    /// macOS wired (kernel) memory in MB
-    pub wired_mb: u64,
-    /// macOS compressed memory in MB
-    pub compressed_mb: u64,
+    /// Kernel/wired memory in MB (macOS: wired, Linux: Slab, Windows: 0)
+    pub kernel_mb: u64,
+    /// Compressed/cached memory in MB (macOS: compressed, Linux: Cached, Windows: 0)
+    pub cached_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,8 +84,8 @@ impl SystemMonitor {
         let cpu = self.collect_cpu();
         let swap = self.collect_swap();
         let top_processes = self.collect_processes();
-        let memory_pressure = self.query_memory_pressure();
-        let thermal_state = self.query_thermal_state();
+        let memory_pressure = query_memory_pressure(memory.used_pct);
+        let thermal_state = query_thermal_state();
 
         Ok(SystemSnapshot {
             timestamp: Utc::now(),
@@ -112,16 +111,15 @@ impl SystemMonitor {
             0.0
         };
 
-        // Query macOS-specific vm_stat for wired + compressed memory
-        let (wired_mb, compressed_mb) = self.query_vm_stat();
+        let (kernel_mb, cached_mb) = query_extra_mem();
 
         MemoryInfo {
             total_mb,
             used_mb,
             available_mb,
             used_pct,
-            wired_mb,
-            compressed_mb,
+            kernel_mb,
+            cached_mb,
         }
     }
 
@@ -132,7 +130,6 @@ impl SystemMonitor {
         } else {
             cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / cpus.len() as f64
         };
-
         CpuInfo {
             usage_pct,
             core_count: cpus.len(),
@@ -149,11 +146,7 @@ impl SystemMonitor {
         } else {
             0.0
         };
-        SwapInfo {
-            total_mb,
-            used_mb,
-            used_pct,
-        }
+        SwapInfo { total_mb, used_mb, used_pct }
     }
 
     fn collect_processes(&self) -> Vec<ProcessInfo> {
@@ -166,87 +159,211 @@ impl SystemMonitor {
                 name: proc.name().to_string_lossy().to_string(),
                 memory_mb: proc.memory() / 1024 / 1024,
                 cpu_pct: proc.cpu_usage(),
-                nice: 0, // sysinfo doesn't expose nice; we query separately
+                nice: 0,
                 run_time_secs: proc.run_time(),
             })
             .collect();
 
-        // Sort by memory descending, take top 20
         processes.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
         processes.truncate(20);
         processes
     }
+}
 
-    /// Parse vm_stat output for wired and compressed memory pages
-    fn query_vm_stat(&self) -> (u64, u64) {
-        let output = Command::new("vm_stat").output();
-        let Ok(out) = output else { return (0, 0) };
-        let text = String::from_utf8_lossy(&out.stdout);
+// ── Platform-specific: extra memory details ────────────────────────────────
 
-        let page_size: u64 = 16384; // M2 uses 16KB pages
-        let mut wired_pages: u64 = 0;
-        let mut compressed_pages: u64 = 0;
+#[cfg(target_os = "macos")]
+fn query_extra_mem() -> (u64, u64) {
+    use std::process::Command;
+    let output = Command::new("vm_stat").output();
+    let Ok(out) = output else { return (0, 0) };
+    let text = String::from_utf8_lossy(&out.stdout);
 
-        for line in text.lines() {
-            if line.starts_with("Pages wired down:") {
-                wired_pages = parse_vm_stat_value(line);
-            } else if line.starts_with("Pages occupied by compressor:") {
-                compressed_pages = parse_vm_stat_value(line);
-            }
-        }
+    let page_size: u64 = 16384; // Apple Silicon uses 16 KB pages
+    let mut wired_pages: u64 = 0;
+    let mut compressed_pages: u64 = 0;
 
-        let wired_mb = wired_pages * page_size / 1024 / 1024;
-        let compressed_mb = compressed_pages * page_size / 1024 / 1024;
-        (wired_mb, compressed_mb)
-    }
-
-    /// Query macOS memory pressure level via `memory_pressure` command
-    fn query_memory_pressure(&self) -> MemoryPressureLevel {
-        let output = Command::new("memory_pressure").output();
-        let Ok(out) = output else {
-            return MemoryPressureLevel::Unknown;
-        };
-        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-
-        if text.contains("critical") {
-            MemoryPressureLevel::Critical
-        } else if text.contains("warn") {
-            MemoryPressureLevel::Warning
-        } else if text.contains("normal") {
-            MemoryPressureLevel::Normal
-        } else {
-            MemoryPressureLevel::Unknown
+    for line in text.lines() {
+        if line.starts_with("Pages wired down:") {
+            wired_pages = parse_colon_u64(line);
+        } else if line.starts_with("Pages occupied by compressor:") {
+            compressed_pages = parse_colon_u64(line);
         }
     }
 
-    /// Query macOS thermal state via pmset
-    fn query_thermal_state(&self) -> ThermalState {
-        let output = Command::new("pmset").args(["-g", "therm"]).output();
-        let Ok(out) = output else {
-            return ThermalState::Unknown;
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
+    let kernel_mb = wired_pages * page_size / 1024 / 1024;
+    let cached_mb = compressed_pages * page_size / 1024 / 1024;
+    (kernel_mb, cached_mb)
+}
 
-        // Look for CPU_Speed_Limit < 100 indicating throttling
-        for line in text.lines() {
-            if line.contains("CPU_Speed_Limit") {
-                if let Some(val_str) = line.split('=').nth(1) {
-                    if let Ok(val) = val_str.trim().parse::<u32>() {
-                        return match val {
-                            100 => ThermalState::Nominal,
-                            75..=99 => ThermalState::Fair,
-                            50..=74 => ThermalState::Serious,
-                            _ => ThermalState::Critical,
-                        };
-                    }
-                }
-            }
+#[cfg(target_os = "linux")]
+fn query_extra_mem() -> (u64, u64) {
+    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+        return (0, 0);
+    };
+    let mut cached_kb: u64 = 0;
+    let mut slab_kb: u64 = 0;
+    for line in content.lines() {
+        if line.starts_with("Cached:") {
+            cached_kb = parse_meminfo_kb(line);
+        } else if line.starts_with("Slab:") {
+            slab_kb = parse_meminfo_kb(line);
         }
-        ThermalState::Nominal
+    }
+    (slab_kb / 1024, cached_kb / 1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn query_extra_mem() -> (u64, u64) {
+    (0, 0)
+}
+
+// ── Platform-specific: memory pressure ────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
+    use std::process::Command;
+    let output = Command::new("memory_pressure").output();
+    let Ok(out) = output else {
+        return pressure_from_pct(used_pct);
+    };
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    if text.contains("critical") {
+        MemoryPressureLevel::Critical
+    } else if text.contains("warn") {
+        MemoryPressureLevel::Warning
+    } else if text.contains("normal") {
+        MemoryPressureLevel::Normal
+    } else {
+        pressure_from_pct(used_pct)
     }
 }
 
-fn parse_vm_stat_value(line: &str) -> u64 {
+#[cfg(target_os = "linux")]
+fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
+    // Linux Pressure Stall Information (kernel 4.20+)
+    let Ok(content) = std::fs::read_to_string("/proc/pressure/memory") else {
+        return pressure_from_pct(used_pct);
+    };
+    for line in content.lines() {
+        if line.starts_with("some ") {
+            if let Some(part) = line.split("avg10=").nth(1) {
+                let avg10: f64 = part.split_whitespace().next()
+                    .unwrap_or("0").parse().unwrap_or(0.0);
+                return if avg10 >= 30.0 {
+                    MemoryPressureLevel::Critical
+                } else if avg10 >= 5.0 {
+                    MemoryPressureLevel::Warning
+                } else {
+                    MemoryPressureLevel::Normal
+                };
+            }
+        }
+    }
+    pressure_from_pct(used_pct)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
+    pressure_from_pct(used_pct)
+}
+
+fn pressure_from_pct(used_pct: f64) -> MemoryPressureLevel {
+    if used_pct >= 92.0 {
+        MemoryPressureLevel::Critical
+    } else if used_pct >= 80.0 {
+        MemoryPressureLevel::Warning
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+// ── Platform-specific: thermal state ──────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn query_thermal_state() -> ThermalState {
+    use std::process::Command;
+    let output = Command::new("pmset").args(["-g", "therm"]).output();
+    let Ok(out) = output else { return ThermalState::Unknown };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains("CPU_Speed_Limit") {
+            if let Some(val_str) = line.split('=').nth(1) {
+                if let Ok(val) = val_str.trim().parse::<u32>() {
+                    return match val {
+                        100 => ThermalState::Nominal,
+                        75..=99 => ThermalState::Fair,
+                        50..=74 => ThermalState::Serious,
+                        _ => ThermalState::Critical,
+                    };
+                }
+            }
+        }
+    }
+    ThermalState::Nominal
+}
+
+#[cfg(target_os = "linux")]
+fn query_thermal_state() -> ThermalState {
+    // Try the first available thermal zone
+    for zone in 0..=4u32 {
+        let path = format!("/sys/class/thermal/thermal_zone{}/temp", zone);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(millidegrees) = s.trim().parse::<u64>() {
+                let celsius = millidegrees / 1000;
+                return match celsius {
+                    0..=59 => ThermalState::Nominal,
+                    60..=74 => ThermalState::Fair,
+                    75..=84 => ThermalState::Serious,
+                    _ => ThermalState::Critical,
+                };
+            }
+        }
+    }
+    ThermalState::Unknown
+}
+
+#[cfg(target_os = "windows")]
+fn query_thermal_state() -> ThermalState {
+    use std::process::Command;
+    // MSAcpi_ThermalZoneTemperature returns tenths of Kelvin
+    let output = Command::new("wmic")
+        .args([
+            "/namespace:\\\\root\\wmi",
+            "PATH",
+            "MSAcpi_ThermalZoneTemperature",
+            "get",
+            "CurrentTemperature",
+        ])
+        .output();
+    let Ok(out) = output else { return ThermalState::Unknown };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().skip(1) {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(raw) = trimmed.parse::<u64>() {
+                let celsius = raw.saturating_sub(2732) / 10;
+                return match celsius {
+                    0..=59 => ThermalState::Nominal,
+                    60..=74 => ThermalState::Fair,
+                    75..=84 => ThermalState::Serious,
+                    _ => ThermalState::Critical,
+                };
+            }
+        }
+    }
+    ThermalState::Unknown
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn query_thermal_state() -> ThermalState {
+    ThermalState::Unknown
+}
+
+// ── Parse helpers ──────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn parse_colon_u64(line: &str) -> u64 {
     line.split(':')
         .nth(1)
         .unwrap_or("0")
@@ -256,6 +373,14 @@ fn parse_vm_stat_value(line: &str) -> u64 {
         .parse()
         .unwrap_or(0)
 }
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_kb(line: &str) -> u64 {
+    // "Cached:    123456 kB"
+    line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0)
+}
+
+// ── Snapshot display ───────────────────────────────────────────────────────
 
 impl SystemSnapshot {
     pub fn summary(&self) -> String {

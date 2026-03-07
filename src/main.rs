@@ -19,14 +19,14 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "deepspeed",
-    about = "AI-powered macOS system optimizer for M2/8GB",
+    about = "AI-powered system optimizer — macOS, Linux, Windows",
     version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to config file (default: ~/.config/deepspeed/deepspeed.toml)
+    /// Path to config file
     #[arg(short, long)]
     config: Option<String>,
 }
@@ -39,9 +39,9 @@ enum Commands {
     Status,
     /// Print the effective config and exit
     Config,
-    /// Install the launchd plist for auto-start on login
+    /// Install as a login daemon (launchd / systemd / Task Scheduler)
     Install,
-    /// Uninstall the launchd plist
+    /// Uninstall the daemon
     Uninstall,
 }
 
@@ -55,7 +55,6 @@ async fn main() -> Result<()> {
         cfg = toml::from_str(&content)?;
     }
 
-    // Bootstrap logging
     setup_logging(&cfg);
 
     match cli.command.unwrap_or(Commands::Start) {
@@ -65,8 +64,8 @@ async fn main() -> Result<()> {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Commands::Install => install_launchd(),
-        Commands::Uninstall => uninstall_launchd(),
+        Commands::Install => install_daemon(),
+        Commands::Uninstall => uninstall_daemon(),
     }
 }
 
@@ -74,7 +73,8 @@ async fn main() -> Result<()> {
 
 async fn run_daemon(config: Config) -> Result<()> {
     info!(
-        "DeepSpeed starting — monitor every {}s, AI enabled: {}",
+        "DeepSpeed starting — OS: {}, monitor every {}s, AI enabled: {}",
+        std::env::consts::OS,
         config.general.monitor_interval_secs,
         config.ai_enabled()
     );
@@ -85,7 +85,7 @@ async fn run_daemon(config: Config) -> Result<()> {
             config.ai.model, config.ai.action_cooldown_secs
         );
     } else {
-        info!("Running in rule-only mode (no API key set)");
+        info!("Running in rule-only mode (set ANTHROPIC_API_KEY to enable AI)");
     }
 
     let monitor = Arc::new(Mutex::new(SystemMonitor::new()));
@@ -98,7 +98,6 @@ async fn run_daemon(config: Config) -> Result<()> {
     loop {
         ticker.tick().await;
 
-        // Collect snapshot
         let snapshot = {
             let mut mon = monitor.lock().await;
             match mon.snapshot() {
@@ -112,7 +111,6 @@ async fn run_daemon(config: Config) -> Result<()> {
 
         info!("{}", snapshot.summary());
 
-        // Run rule-based optimizer
         let result = {
             let mut opt = optimizer.lock().await;
             opt.run(&snapshot)
@@ -122,12 +120,11 @@ async fn run_daemon(config: Config) -> Result<()> {
             info!("Rule action: {}", action);
         }
 
-        // Escalate to AI only when rules signal it's needed
         if result.needs_ai {
             let ai_check = ai_engine.lock().await;
             if ai_check.can_call() {
                 let snap_clone = snapshot.clone();
-                drop(ai_check); // release lock before await
+                drop(ai_check);
 
                 let mut ai = ai_engine.lock().await;
                 match ai.analyze(&snap_clone).await {
@@ -144,9 +141,7 @@ async fn run_daemon(config: Config) -> Result<()> {
                             info!("{}", a);
                         }
                     }
-                    Err(e) => {
-                        warn!("AI analysis failed: {}", e);
-                    }
+                    Err(e) => warn!("AI analysis failed: {}", e),
                 }
             } else {
                 info!("AI escalation requested but engine is on cooldown — skipping");
@@ -162,11 +157,22 @@ fn run_status() -> Result<()> {
     let snap = monitor.snapshot()?;
 
     println!("=== DeepSpeed System Status ===\n");
-    println!("Memory:   {:.1}% used ({} MB used / {} MB total)", snap.memory.used_pct, snap.memory.used_mb, snap.memory.total_mb);
+    println!("OS:       {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "Memory:   {:.1}% used ({} MB used / {} MB total)",
+        snap.memory.used_pct, snap.memory.used_mb, snap.memory.total_mb
+    );
     println!("          {} MB available", snap.memory.available_mb);
-    println!("          {} MB wired (kernel)", snap.memory.wired_mb);
-    println!("          {} MB compressed", snap.memory.compressed_mb);
-    println!("Swap:     {:.1}% used ({}/{} MB)", snap.swap.used_pct, snap.swap.used_mb, snap.swap.total_mb);
+    if snap.memory.kernel_mb > 0 {
+        println!("          {} MB kernel/wired", snap.memory.kernel_mb);
+    }
+    if snap.memory.cached_mb > 0 {
+        println!("          {} MB compressed/cached", snap.memory.cached_mb);
+    }
+    println!(
+        "Swap:     {:.1}% used ({}/{} MB)",
+        snap.swap.used_pct, snap.swap.used_mb, snap.swap.total_mb
+    );
     println!("CPU:      {:.1}% ({} cores)", snap.cpu.usage_pct, snap.cpu.core_count);
     println!("Pressure: {:?}", snap.memory_pressure);
     println!("Thermal:  {:?}", snap.thermal_state);
@@ -174,19 +180,16 @@ fn run_status() -> Result<()> {
     for (i, p) in snap.top_processes.iter().take(10).enumerate() {
         println!(
             "  {:2}. {:30} {:5} MB   {:5.1}% CPU   pid {}",
-            i + 1,
-            p.name,
-            p.memory_mb,
-            p.cpu_pct,
-            p.pid,
+            i + 1, p.name, p.memory_mb, p.cpu_pct, p.pid,
         );
     }
     Ok(())
 }
 
-// ── launchd helpers ────────────────────────────────────────────────────────
+// ── Daemon install / uninstall (platform-specific) ────────────────────────
 
-fn install_launchd() -> Result<()> {
+#[cfg(target_os = "macos")]
+fn install_daemon() -> Result<()> {
     let home = dirs::home_dir().expect("Cannot find home dir");
     let plist_dir = home.join("Library").join("LaunchAgents");
     std::fs::create_dir_all(&plist_dir)?;
@@ -231,22 +234,22 @@ fn install_launchd() -> Result<()> {
     let plist_path = plist_dir.join("com.deepspeed.daemon.plist");
     std::fs::write(&plist_path, plist_content)?;
 
-    // Load it now
     let status = std::process::Command::new("launchctl")
         .args(["load", "-w", plist_path.to_str().unwrap()])
         .status()?;
 
     if status.success() {
-        println!("DeepSpeed installed and started.");
-        println!("Plist: {:?}", plist_path);
-        println!("Log:   {:?}", log_dir.join("deepspeed.log"));
+        println!("DeepSpeed installed and started (launchd).");
+        println!("Plist: {}", plist_path.display());
+        println!("Log:   {}", log_dir.join("deepspeed.log").display());
     } else {
         eprintln!("launchctl load failed — plist written but not loaded.");
     }
     Ok(())
 }
 
-fn uninstall_launchd() -> Result<()> {
+#[cfg(target_os = "macos")]
+fn uninstall_daemon() -> Result<()> {
     let home = dirs::home_dir().expect("Cannot find home dir");
     let plist_path = home
         .join("Library")
@@ -259,39 +262,175 @@ fn uninstall_launchd() -> Result<()> {
             .status()
             .ok();
         std::fs::remove_file(&plist_path)?;
-        println!("DeepSpeed uninstalled.");
+        println!("DeepSpeed uninstalled (launchd agent removed).");
     } else {
-        println!("DeepSpeed plist not found — already uninstalled?");
+        println!("No launchd plist found — already uninstalled?");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_daemon() -> Result<()> {
+    let exe_path = std::env::current_exe()?;
+    let service_dir = dirs::home_dir()
+        .expect("Cannot find home dir")
+        .join(".config")
+        .join("systemd")
+        .join("user");
+    std::fs::create_dir_all(&service_dir)?;
+
+    let service_content = format!(
+        r#"[Unit]
+Description=DeepSpeed AI System Optimizer
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={exe} start
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
+"#,
+        exe = exe_path.display()
+    );
+
+    let service_path = service_dir.join("deepspeed.service");
+    std::fs::write(&service_path, service_content)?;
+
+    // Enable and start
+    let enable = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "deepspeed"])
+        .status()?;
+
+    if enable.success() {
+        println!("DeepSpeed installed and started (systemd user service).");
+        println!("Service: {}", service_path.display());
+        println!("Logs:    journalctl --user -u deepspeed -f");
+    } else {
+        eprintln!("systemctl enable failed — service file written but not enabled.");
+        eprintln!("Run manually: systemctl --user enable --now deepspeed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_daemon() -> Result<()> {
+    std::process::Command::new("systemctl")
+        .args(["--user", "disable", "--now", "deepspeed"])
+        .status()
+        .ok();
+
+    let service_path = dirs::home_dir()
+        .expect("Cannot find home dir")
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("deepspeed.service");
+
+    if service_path.exists() {
+        std::fs::remove_file(&service_path)?;
+        println!("DeepSpeed uninstalled (systemd service removed).");
+    } else {
+        println!("No systemd service found — already uninstalled?");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_daemon() -> Result<()> {
+    let exe_path = std::env::current_exe()?;
+    let exe_str = exe_path.to_string_lossy().replace('\'', "\"");
+
+    let script = format!(
+        r#"
+        $action   = New-ScheduledTaskAction -Execute '{exe}' -Argument 'start'
+        $trigger  = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal `
+                        -UserId $env:USERNAME `
+                        -LogonType Interactive `
+                        -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet `
+                        -ExecutionTimeLimit 0 `
+                        -RestartCount 3 `
+                        -RestartInterval (New-TimeSpan -Minutes 1) `
+                        -Priority 7
+        Register-ScheduledTask `
+            -TaskName 'DeepSpeed' `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Force
+        Start-ScheduledTask -TaskName 'DeepSpeed'
+        Write-Host 'DeepSpeed installed and started (Task Scheduler).'
+        "#,
+        exe = exe_str
+    );
+
+    let status = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-Command", &script])
+        .status()?;
+
+    if !status.success() {
+        eprintln!("Task Scheduler registration failed.");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_daemon() -> Result<()> {
+    let script = r#"
+        Stop-ScheduledTask -TaskName 'DeepSpeed' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'DeepSpeed' -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host 'DeepSpeed uninstalled (Task Scheduler task removed).'
+    "#;
+    std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-Command", script])
+        .status()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn install_daemon() -> Result<()> {
+    eprintln!("Auto-install not supported on this platform. Run `deepspeed start` manually.");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn uninstall_daemon() -> Result<()> {
+    eprintln!("Auto-uninstall not supported on this platform.");
     Ok(())
 }
 
 // ── Logging setup ──────────────────────────────────────────────────────────
 
 fn setup_logging(config: &Config) {
-    let log_level = &config.general.log_level;
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+        .unwrap_or_else(|_| EnvFilter::new(&config.general.log_level));
 
     let log_path = config.log_path();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    // Try file appender; fall back to stderr
-    match tracing_appender::rolling::never(
-        log_path.parent().unwrap_or_else(|| std::path::Path::new("/tmp")),
-        log_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("deepspeed.log")),
-    ) {
-        appender => {
-            let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
-            // Keep _guard alive by leaking it (daemon runs forever)
-            std::mem::forget(_guard);
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .init();
-        }
-    }
+    let log_dir = log_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let log_file = log_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("deepspeed.log"));
+
+    let appender = tracing_appender::rolling::never(log_dir, log_file);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    std::mem::forget(guard); // daemon runs forever
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .init();
 }

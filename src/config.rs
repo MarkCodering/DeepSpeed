@@ -65,20 +65,15 @@ impl Default for Config {
                 swap_critical_pct: 70.0,
                 cpu_warning_pct: 85.0,
                 cpu_sustained_secs: 60,
+                // Scale heavy process threshold to 6% of total memory by default;
+                // users with more RAM may want to raise this in their config.
                 process_heavy_memory_mb: 500,
             },
             actions: ActionsConfig {
                 allow_purge_cache: false,
                 allow_renice: true,
                 renice_value: 10,
-                protected_processes: vec![
-                    "Finder".to_string(),
-                    "WindowServer".to_string(),
-                    "loginwindow".to_string(),
-                    "SystemUIServer".to_string(),
-                    "Dock".to_string(),
-                    "deepspeed".to_string(),
-                ],
+                protected_processes: vec![],
                 min_process_age_secs: 120,
             },
             ai: AiConfig {
@@ -97,7 +92,7 @@ impl Config {
         let config_path = Self::config_path()?;
 
         if !config_path.exists() {
-            tracing::info!("No config file found at {:?}, using defaults", config_path);
+            tracing::info!("No config file at {:?} — using defaults", config_path);
             return Ok(Config::default());
         }
 
@@ -107,7 +102,7 @@ impl Config {
         let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config at {:?}", config_path))?;
 
-        // Allow env var to override API key
+        // Environment variable always wins over config file
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             if !key.is_empty() {
                 config.ai.api_key = key;
@@ -118,16 +113,50 @@ impl Config {
     }
 
     pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        Ok(home.join(".config").join("deepspeed").join("deepspeed.toml"))
+        #[cfg(target_os = "windows")]
+        {
+            let base = dirs::config_dir()
+                .context("Cannot find AppData\\Roaming")?;
+            Ok(base.join("deepspeed").join("deepspeed.toml"))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let home = dirs::home_dir().context("Cannot determine home directory")?;
+            Ok(home.join(".config").join("deepspeed").join("deepspeed.toml"))
+        }
     }
 
     pub fn log_path(&self) -> PathBuf {
         if !self.general.log_file.is_empty() {
             return PathBuf::from(&self.general.log_file);
         }
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        home.join("Library").join("Logs").join("deepspeed.log")
+
+        #[cfg(target_os = "macos")]
+        {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::env::temp_dir())
+                .join("Library")
+                .join("Logs")
+                .join("deepspeed.log")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::env::temp_dir())
+                .join("deepspeed")
+                .join("deepspeed.log")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::env::temp_dir())
+                .join("DeepSpeed")
+                .join("deepspeed.log")
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            std::env::temp_dir().join("deepspeed.log")
+        }
     }
 
     pub fn ai_enabled(&self) -> bool {
