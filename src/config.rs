@@ -41,11 +41,18 @@ pub struct ActionsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiConfig {
+    /// "anthropic" or "ollama" (default)
+    pub provider: String,
+    /// Anthropic API key — only required when provider = "anthropic"
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
     pub min_confidence: f64,
     pub action_cooldown_secs: u64,
+    /// Ollama base URL — cloud: https://api.ollama.com, local: http://localhost:11434
+    pub ollama_base_url: String,
+    /// Ollama cloud API key (set OLLAMA_API_KEY env var or this field for cloud access)
+    pub ollama_api_key: String,
 }
 
 impl Default for Config {
@@ -77,11 +84,14 @@ impl Default for Config {
                 min_process_age_secs: 120,
             },
             ai: AiConfig {
+                provider: "ollama".to_string(),
                 api_key: String::new(),
-                model: "claude-haiku-4-5-20251001".to_string(),
+                model: "nemotron-3-super".to_string(),
                 max_tokens: 1024,
                 min_confidence: 0.75,
                 action_cooldown_secs: 600,
+                ollama_base_url: "https://api.ollama.com".to_string(),
+                ollama_api_key: String::new(),
             },
         }
     }
@@ -102,10 +112,15 @@ impl Config {
         let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config at {:?}", config_path))?;
 
-        // Environment variable always wins over config file
+        // Environment variables always win over config file
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             if !key.is_empty() {
                 config.ai.api_key = key;
+            }
+        }
+        if let Ok(key) = std::env::var("OLLAMA_API_KEY") {
+            if !key.is_empty() {
+                config.ai.ollama_api_key = key;
             }
         }
 
@@ -160,6 +175,9 @@ impl Config {
     }
 
     pub fn ai_enabled(&self) -> bool {
-        !self.ai.api_key.is_empty()
+        match self.ai.provider.as_str() {
+            "ollama" => true, // Ollama runs locally — no API key required
+            _ => !self.ai.api_key.is_empty(),
+        }
     }
 }

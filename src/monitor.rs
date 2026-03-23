@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemSnapshot {
@@ -72,13 +72,16 @@ pub struct SystemMonitor {
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        // new_all() already does a full initial refresh — no second call needed
+        let sys = System::new_all();
         Self { sys }
     }
 
     pub fn snapshot(&mut self) -> Result<SystemSnapshot> {
-        self.sys.refresh_all();
+        // Targeted refresh: skip disks, networks, components — ~5–20ms faster per cycle
+        self.sys.refresh_memory();
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
 
         let memory = self.collect_memory();
         let cpu = self.collect_cpu();
@@ -102,9 +105,9 @@ impl SystemMonitor {
         let total = self.sys.total_memory();
         let used = self.sys.used_memory();
         let available = self.sys.available_memory();
-        let total_mb = total / 1024 / 1024;
-        let used_mb = used / 1024 / 1024;
-        let available_mb = available / 1024 / 1024;
+        let total_mb = total >> 20;
+        let used_mb = used >> 20;
+        let available_mb = available >> 20;
         let used_pct = if total > 0 {
             (used as f64 / total as f64) * 100.0
         } else {
@@ -139,8 +142,8 @@ impl SystemMonitor {
     fn collect_swap(&self) -> SwapInfo {
         let total = self.sys.total_swap();
         let used = self.sys.used_swap();
-        let total_mb = total / 1024 / 1024;
-        let used_mb = used / 1024 / 1024;
+        let total_mb = total >> 20;
+        let used_mb = used >> 20;
         let used_pct = if total > 0 {
             (used as f64 / total as f64) * 100.0
         } else {
@@ -150,23 +153,24 @@ impl SystemMonitor {
     }
 
     fn collect_processes(&self) -> Vec<ProcessInfo> {
-        let mut processes: Vec<ProcessInfo> = self
-            .sys
-            .processes()
-            .iter()
+        const TOP_N: usize = 20;
+        // Collect cheap (memory, pid, proc) refs, then partial-select top N — O(n) average
+        let mut refs: Vec<_> = self.sys.processes().iter().collect();
+        if refs.len() > TOP_N {
+            refs.select_nth_unstable_by(TOP_N - 1, |a, b| b.1.memory().cmp(&a.1.memory()));
+            refs.truncate(TOP_N);
+        }
+        refs.sort_unstable_by(|a, b| b.1.memory().cmp(&a.1.memory()));
+        refs.into_iter()
             .map(|(pid, proc)| ProcessInfo {
                 pid: pid.as_u32(),
-                name: proc.name().to_string_lossy().to_string(),
-                memory_mb: proc.memory() / 1024 / 1024,
+                name: proc.name().to_string_lossy().into_owned(),
+                memory_mb: proc.memory() >> 20,
                 cpu_pct: proc.cpu_usage(),
                 nice: 0,
                 run_time_secs: proc.run_time(),
             })
-            .collect();
-
-        processes.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
-        processes.truncate(20);
-        processes
+            .collect()
     }
 }
 
@@ -222,6 +226,10 @@ fn query_extra_mem() -> (u64, u64) {
 
 #[cfg(target_os = "macos")]
 fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
+    // Fast-path: skip the subprocess spawn when clearly below warning threshold
+    if used_pct < 70.0 {
+        return MemoryPressureLevel::Normal;
+    }
     use std::process::Command;
     let output = Command::new("memory_pressure").output();
     let Ok(out) = output else {

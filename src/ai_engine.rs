@@ -1,6 +1,5 @@
-/// AI Engine — calls Claude only when rule-based optimizer escalates.
-/// This keeps API costs minimal: calls happen only during genuine crises,
-/// not on a fixed schedule.
+/// AI Engine — calls Claude (Anthropic) or a local Ollama model when the
+/// rule-based optimizer escalates. Calls happen only during genuine crises.
 use crate::actions::{Action, ActionExecutor};
 use crate::config::Config;
 use crate::monitor::SystemSnapshot;
@@ -26,11 +25,11 @@ struct AnthropicRequest {
     model: String,
     max_tokens: u32,
     system: String,
-    messages: Vec<Message>,
+    messages: Vec<ChatMessage>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Message {
+struct ChatMessage {
     role: String,
     content: String,
 }
@@ -45,6 +44,24 @@ struct ContentBlock {
     #[serde(rename = "type")]
     block_type: String,
     text: Option<String>,
+}
+
+// ── Ollama cloud API types (OpenAI-compatible /v1/chat/completions) ────────
+
+#[derive(Serialize)]
+struct OllamaRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    choices: Vec<OllamaChoice>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChoice {
+    message: ChatMessage,
 }
 
 // ── AI recommendation types ────────────────────────────────────────────────
@@ -103,8 +120,74 @@ impl AiEngine {
             anyhow::bail!("AI engine on cooldown — skipping call");
         }
 
-        info!("Calling Claude AI (call #{}) to analyze system state", self.call_count + 1);
+        info!(
+            "Calling {} AI (call #{}, model: {}) to analyze system state",
+            self.config.ai.provider, self.call_count + 1, self.config.ai.model
+        );
 
+        let text = match self.config.ai.provider.as_str() {
+            "ollama" => self.call_ollama(snap).await?,
+            _ => self.call_anthropic(snap).await?,
+        };
+
+        self.last_call = Some(Instant::now());
+        self.call_count += 1;
+
+        let recommendation = Self::parse_recommendation(&text)?;
+        info!(
+            "AI recommendation (confidence={:.2}): {}",
+            recommendation.confidence, recommendation.summary
+        );
+
+        Ok(recommendation)
+    }
+
+    // ── Provider: Ollama cloud ─────────────────────────────────────────────
+
+    async fn call_ollama(&self, snap: &SystemSnapshot) -> Result<String> {
+        let request = OllamaRequest {
+            model: self.config.ai.model.clone(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: Self::build_system_prompt() },
+                ChatMessage { role: "user".to_string(),   content: Self::build_user_message(snap) },
+            ],
+        };
+
+        // Ollama cloud uses the OpenAI-compatible endpoint
+        let url = format!("{}/v1/chat/completions", self.config.ai.ollama_base_url);
+        let mut req = self.client.post(&url).json(&request);
+
+        if !self.config.ai.ollama_api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.config.ai.ollama_api_key));
+        }
+
+        let response = req
+            .send()
+            .await
+            .context("Failed to reach Ollama cloud API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Ollama API error {}: {}", status, body);
+        }
+
+        let ollama_resp: OllamaResponse = response
+            .json()
+            .await
+            .context("Failed to parse Ollama response")?;
+
+        ollama_resp
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .context("Ollama response contained no choices")
+    }
+
+    // ── Provider: Anthropic ────────────────────────────────────────────────
+
+    async fn call_anthropic(&self, snap: &SystemSnapshot) -> Result<String> {
         let system_prompt = Self::build_system_prompt();
         let user_message = Self::build_user_message(snap);
 
@@ -112,7 +195,7 @@ impl AiEngine {
             model: self.config.ai.model.clone(),
             max_tokens: self.config.ai.max_tokens,
             system: system_prompt,
-            messages: vec![Message {
+            messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: user_message,
             }],
@@ -140,32 +223,23 @@ impl AiEngine {
             .await
             .context("Failed to parse Anthropic response")?;
 
-        let text = api_response
+        Ok(api_response
             .content
             .iter()
             .find(|b| b.block_type == "text")
             .and_then(|b| b.text.as_deref())
             .unwrap_or("")
-            .to_string();
-
-        self.last_call = Some(Instant::now());
-        self.call_count += 1;
-
-        let recommendation = Self::parse_recommendation(&text)?;
-        info!(
-            "AI recommendation (confidence={:.2}): {}",
-            recommendation.confidence, recommendation.summary
-        );
-
-        Ok(recommendation)
+            .to_string())
     }
 
+    // ── Shared helpers ─────────────────────────────────────────────────────
+
     fn build_system_prompt() -> String {
-        r#"You are DeepSpeed, an AI system optimizer running on an Apple M2 Mac with 8GB unified memory.
+        r#"You are DeepSpeed, an AI system optimizer daemon.
 Your job is to analyze system metrics and recommend targeted, safe optimizations.
 
 CRITICAL RULES:
-1. Never recommend killing essential system processes (kernel_task, WindowServer, loginwindow, Dock, Finder, SystemUIServer, coreaudiod)
+1. Never recommend killing essential system processes (kernel_task, WindowServer, loginwindow, Dock, Finder, SystemUIServer, coreaudiod, systemd, init)
 2. Only recommend renice (lowering priority) — never SIGKILL or SIGTERM
 3. Prefer the least disruptive action possible
 4. If memory pressure will resolve naturally, recommend "none"
@@ -190,10 +264,10 @@ Respond ONLY with valid JSON matching this schema — no markdown, no extra text
     }
 
     fn build_user_message(snap: &SystemSnapshot) -> String {
-        // Serialize only what's needed — keep prompt small to save tokens
-        let top5: Vec<_> = snap.top_processes.iter().take(5).collect();
-        let processes: Vec<String> = top5
+        let processes: Vec<String> = snap
+            .top_processes
             .iter()
+            .take(5)
             .map(|p| {
                 format!(
                     "  - {} (pid={}, mem={}MB, cpu={:.1}%, age={}s, nice={})",

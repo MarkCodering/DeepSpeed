@@ -10,8 +10,6 @@ use config::Config;
 use monitor::SystemMonitor;
 use optimizer::RuleOptimizer;
 use ai_engine::AiEngine;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -81,16 +79,21 @@ async fn run_daemon(config: Config) -> Result<()> {
 
     if config.ai_enabled() {
         info!(
-            "AI engine active (model: {}, cooldown: {}s)",
-            config.ai.model, config.ai.action_cooldown_secs
+            "AI engine active (provider: {}, model: {}, cooldown: {}s)",
+            config.ai.provider, config.ai.model, config.ai.action_cooldown_secs
         );
+        if config.ai.provider == "ollama" {
+            info!("Ollama endpoint: {}", config.ai.ollama_base_url);
+        }
     } else {
-        info!("Running in rule-only mode (set ANTHROPIC_API_KEY to enable AI)");
+        info!("Running in rule-only mode (set provider=ollama or ANTHROPIC_API_KEY to enable AI)");
     }
 
-    let monitor = Arc::new(Mutex::new(SystemMonitor::new()));
-    let optimizer = Arc::new(Mutex::new(RuleOptimizer::new(config.clone())));
-    let ai_engine = Arc::new(Mutex::new(AiEngine::new(config.clone())));
+    // Plain owned values — all access is sequential in the single loop below,
+    // so Arc<Mutex<>> would only add atomic overhead with no benefit.
+    let mut monitor = SystemMonitor::new();
+    let mut optimizer = RuleOptimizer::new(config.clone());
+    let mut ai_engine = AiEngine::new(config.clone());
 
     let monitor_interval = Duration::from_secs(config.general.monitor_interval_secs);
     let mut ticker = interval(monitor_interval);
@@ -98,45 +101,33 @@ async fn run_daemon(config: Config) -> Result<()> {
     loop {
         ticker.tick().await;
 
-        let snapshot = {
-            let mut mon = monitor.lock().await;
-            match mon.snapshot() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to collect system snapshot: {}", e);
-                    continue;
-                }
+        let snapshot = match monitor.snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to collect system snapshot: {}", e);
+                continue;
             }
         };
 
         info!("{}", snapshot.summary());
 
-        let result = {
-            let mut opt = optimizer.lock().await;
-            opt.run(&snapshot)
-        };
+        let result = optimizer.run(&snapshot);
 
         for action in &result.actions_taken {
             info!("Rule action: {}", action);
         }
 
         if result.needs_ai {
-            let ai_check = ai_engine.lock().await;
-            if ai_check.can_call() {
-                let snap_clone = snapshot.clone();
-                drop(ai_check);
-
-                let mut ai = ai_engine.lock().await;
-                match ai.analyze(&snap_clone).await {
+            if ai_engine.can_call() {
+                match ai_engine.analyze(&snapshot).await {
                     Ok(rec) => {
                         info!(
                             "AI (call #{}): {} [confidence={:.2}]",
-                            ai.call_count(),
+                            ai_engine.call_count(),
                             rec.summary,
                             rec.confidence
                         );
-                        let opt = optimizer.lock().await;
-                        let applied = ai.apply_recommendation(&rec, opt.executor(), &config);
+                        let applied = ai_engine.apply_recommendation(&rec, optimizer.executor(), &config);
                         for a in applied {
                             info!("{}", a);
                         }
