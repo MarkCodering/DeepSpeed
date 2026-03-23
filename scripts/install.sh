@@ -37,6 +37,10 @@ echo "Installing to $BIN_DIR/deepspeed..."
 mkdir -p "$BIN_DIR"
 cp "$BINARY" "$BIN_DIR/deepspeed"
 chmod +x "$BIN_DIR/deepspeed"
+# Re-sign with ad-hoc signature — required on Apple Silicon after strip
+if [ "$PLATFORM" = "macos" ]; then
+    codesign --force --sign - "$BIN_DIR/deepspeed" 2>/dev/null || true
+fi
 
 # Add ~/.local/bin to PATH if not already present
 for profile in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
