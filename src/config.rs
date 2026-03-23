@@ -39,19 +39,35 @@ pub struct ActionsConfig {
     pub min_process_age_secs: u64,
 }
 
+// ── Serde default helpers ─────────────────────────────────────────────────
+fn default_ai_provider()    -> String { "ollama".to_string() }
+fn default_ai_model()       -> String { "nemotron-3-super".to_string() }
+fn default_max_tokens()     -> u32    { 1024 }
+fn default_min_confidence() -> f64    { 0.75 }
+fn default_cooldown_secs()  -> u64    { 600 }
+fn default_ollama_url()     -> String { "https://api.ollama.com".to_string() }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiConfig {
     /// "anthropic" or "ollama" (default)
+    #[serde(default = "default_ai_provider")]
     pub provider: String,
     /// Anthropic API key — only required when provider = "anthropic"
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_ai_model")]
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
+    #[serde(default = "default_cooldown_secs")]
     pub action_cooldown_secs: u64,
     /// Ollama base URL — cloud: https://api.ollama.com, local: http://localhost:11434
+    #[serde(default = "default_ollama_url")]
     pub ollama_base_url: String,
     /// Ollama cloud API key (set OLLAMA_API_KEY env var or this field for cloud access)
+    #[serde(default)]
     pub ollama_api_key: String,
 }
 
@@ -59,8 +75,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             general: GeneralConfig {
-                monitor_interval_secs: 30,
-                ai_interval_secs: 300,
+                monitor_interval_secs: 10,
+                ai_interval_secs: 120,
                 log_level: "info".to_string(),
                 log_file: String::new(),
                 notifications_enabled: true,

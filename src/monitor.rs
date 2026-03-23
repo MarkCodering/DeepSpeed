@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,7 @@ pub struct SystemSnapshot {
     pub top_processes: Vec<ProcessInfo>,
     pub memory_pressure: MemoryPressureLevel,
     pub thermal_state: ThermalState,
+    pub gpu: Option<GpuInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,16 @@ pub struct MemoryInfo {
 pub struct CpuInfo {
     pub usage_pct: f64,
     pub core_count: usize,
+    pub per_core_pct: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuInfo {
+    pub name: String,
+    /// None when the platform cannot measure utilisation without root
+    pub utilization_pct: Option<f64>,
+    pub vram_total_mb: Option<u64>,
+    pub vram_used_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,20 +80,31 @@ pub enum ThermalState {
 
 pub struct SystemMonitor {
     sys: System,
+    /// GPU info cached at startup; re-queried every 10 s on platforms with live utilisation
+    gpu_cache: Option<GpuInfo>,
+    gpu_last_refresh: Instant,
 }
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        // new_all() already does a full initial refresh — no second call needed
         let sys = System::new_all();
-        Self { sys }
+        let gpu_cache = query_gpu_info();
+        Self { sys, gpu_cache, gpu_last_refresh: Instant::now() }
     }
 
     pub fn snapshot(&mut self) -> Result<SystemSnapshot> {
-        // Targeted refresh: skip disks, networks, components — ~5–20ms faster per cycle
+        // Targeted refresh — skip disks, networks, components
         self.sys.refresh_memory();
         self.sys.refresh_cpu_usage();
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
+
+        // Re-query GPU every 10 s (picks up live utilisation on Linux/NVIDIA)
+        if self.gpu_last_refresh.elapsed().as_secs() >= 10 {
+            if let Some(fresh) = query_gpu_info() {
+                self.gpu_cache = Some(fresh);
+            }
+            self.gpu_last_refresh = Instant::now();
+        }
 
         let memory = self.collect_memory();
         let cpu = self.collect_cpu();
@@ -98,6 +121,7 @@ impl SystemMonitor {
             top_processes,
             memory_pressure,
             thermal_state,
+            gpu: self.gpu_cache.clone(),
         })
     }
 
@@ -128,14 +152,16 @@ impl SystemMonitor {
 
     fn collect_cpu(&self) -> CpuInfo {
         let cpus = self.sys.cpus();
-        let usage_pct = if cpus.is_empty() {
+        let per_core_pct: Vec<f64> = cpus.iter().map(|c| c.cpu_usage() as f64).collect();
+        let usage_pct = if per_core_pct.is_empty() {
             0.0
         } else {
-            cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / cpus.len() as f64
+            per_core_pct.iter().sum::<f64>() / per_core_pct.len() as f64
         };
         CpuInfo {
             usage_pct,
             core_count: cpus.len(),
+            per_core_pct,
         }
     }
 
@@ -366,6 +392,123 @@ fn query_thermal_state() -> ThermalState {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn query_thermal_state() -> ThermalState {
     ThermalState::Unknown
+}
+
+// ── GPU info ───────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn query_gpu_info() -> Option<GpuInfo> {
+    use std::process::Command;
+    let out = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let entry = json.get("SPDisplaysDataType")?.as_array()?.first()?;
+    let name = entry.get("_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown GPU")
+        .to_string();
+    let vram_str = entry.get("spdisplays_vram")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Some(GpuInfo {
+        name,
+        utilization_pct: None, // requires root (powermetrics)
+        vram_total_mb: parse_vram_mb(vram_str),
+        vram_used_mb: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn query_gpu_info() -> Option<GpuInfo> {
+    // NVIDIA first, then AMD
+    query_nvidia_gpu().or_else(query_amd_gpu)
+}
+
+#[cfg(target_os = "linux")]
+fn query_nvidia_gpu() -> Option<GpuInfo> {
+    use std::process::Command;
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<&str> = text.lines().next()?.split(',').map(str::trim).collect();
+    if parts.len() < 4 { return None; }
+    Some(GpuInfo {
+        name: parts[0].to_string(),
+        utilization_pct: parts[1].parse().ok(),
+        vram_used_mb: parts[2].parse().ok(),
+        vram_total_mb: parts[3].parse().ok(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn query_amd_gpu() -> Option<GpuInfo> {
+    use std::process::Command;
+    let out = Command::new("rocm-smi")
+        .args(["--showuse", "--showmeminfo", "vram", "--csv"])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    // Parse first data row: device,gpu_use_pct,vram_used,vram_total
+    for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+        let p: Vec<&str> = line.split(',').map(str::trim).collect();
+        if p.len() >= 4 {
+            return Some(GpuInfo {
+                name: format!("AMD GPU ({})", p[0]),
+                utilization_pct: p[1].trim_end_matches('%').parse().ok(),
+                vram_used_mb: p[2].parse::<u64>().ok().map(|b| b / 1024 / 1024),
+                vram_total_mb: p[3].parse::<u64>().ok().map(|b| b / 1024 / 1024),
+            });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_gpu_info() -> Option<GpuInfo> {
+    use std::process::Command;
+    let out = Command::new("wmic")
+        .args(["path", "win32_VideoController", "get", "Name,AdapterRAM", "/format:csv"])
+        .output()
+        .ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines().skip(2) {
+        let p: Vec<&str> = line.split(',').collect();
+        if p.len() >= 3 {
+            let name = p[1].trim().to_string();
+            let bytes: u64 = p[2].trim().parse().unwrap_or(0);
+            if !name.is_empty() {
+                return Some(GpuInfo {
+                    name,
+                    utilization_pct: None,
+                    vram_total_mb: Some(bytes / 1024 / 1024),
+                    vram_used_mb: None,
+                });
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn query_gpu_info() -> Option<GpuInfo> { None }
+
+fn parse_vram_mb(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("shared") || s.is_empty() { return None; }
+    let mut parts = s.splitn(2, ' ');
+    let num: f64 = parts.next()?.parse().ok()?;
+    match parts.next()?.trim().to_uppercase().as_str() {
+        "GB" | "GIB" => Some((num * 1024.0) as u64),
+        "MB" | "MIB" => Some(num as u64),
+        _ => None,
+    }
 }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────

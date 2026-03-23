@@ -3,6 +3,7 @@ mod ai_engine;
 mod config;
 mod monitor;
 mod optimizer;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -33,6 +34,8 @@ struct Cli {
 enum Commands {
     /// Start the background optimization daemon (default)
     Start,
+    /// Open the interactive TUI monitor (CPU, GPU, memory, processes)
+    Monitor,
     /// Print a one-shot system snapshot and exit
     Status,
     /// Print the effective config and exit
@@ -56,13 +59,14 @@ async fn main() -> Result<()> {
     setup_logging(&cfg);
 
     match cli.command.unwrap_or(Commands::Start) {
-        Commands::Start => run_daemon(cfg).await,
-        Commands::Status => run_status(),
-        Commands::Config => {
+        Commands::Start   => run_daemon(cfg).await,
+        Commands::Monitor => tokio::task::block_in_place(|| tui::run_tui(cfg)),
+        Commands::Status  => run_status(),
+        Commands::Config  => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Commands::Install => install_daemon(),
+        Commands::Install   => install_daemon(),
         Commands::Uninstall => uninstall_daemon(),
     }
 }
