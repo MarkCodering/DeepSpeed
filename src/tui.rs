@@ -1,4 +1,4 @@
-/// Interactive TUI for DeepSpeed — shows CPU (per-core), GPU, memory, and process table.
+/// Interactive TUI — CPU (per-core gauges + history curve), Memory, GPU, processes.
 /// Run with: `deepspeed monitor`
 use std::collections::VecDeque;
 use std::io;
@@ -14,14 +14,19 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState},
+    widgets::{
+        Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table,
+        TableState,
+    },
     Frame, Terminal,
 };
 
 use crate::config::Config;
-use crate::monitor::{GpuInfo, MemoryPressureLevel, SystemMonitor, SystemSnapshot, ThermalState};
+use crate::monitor::{MemoryPressureLevel, SystemMonitor, SystemSnapshot, ThermalState};
 
+const MAX_HISTORY: usize = 60; // number of samples kept (60 × 2 s = 2 min)
 const MAX_LOG: usize = 200;
 const REFRESH_SECS: u64 = 2;
 
@@ -33,6 +38,11 @@ struct App {
     process_scroll: usize,
     last_refresh: Instant,
     config: Config,
+    // Rolling history for 2-D curves
+    cpu_history: VecDeque<f64>,
+    mem_history: VecDeque<f64>,
+    swap_history: VecDeque<f64>,
+    gpu_history: VecDeque<f64>,
 }
 
 impl App {
@@ -42,10 +52,29 @@ impl App {
             snapshot: None,
             log: VecDeque::with_capacity(MAX_LOG),
             process_scroll: 0,
-            // Subtract interval so the first draw triggers an immediate refresh
             last_refresh: Instant::now() - refresh - Duration::from_millis(1),
             config,
+            cpu_history: VecDeque::with_capacity(MAX_HISTORY),
+            mem_history: VecDeque::with_capacity(MAX_HISTORY),
+            swap_history: VecDeque::with_capacity(MAX_HISTORY),
+            gpu_history: VecDeque::with_capacity(MAX_HISTORY),
         }
+    }
+
+    fn ingest_snapshot(&mut self, snap: SystemSnapshot) {
+        push_history(&mut self.cpu_history, snap.cpu.usage_pct);
+        push_history(&mut self.mem_history, snap.memory.used_pct);
+        push_history(&mut self.swap_history, snap.swap.used_pct);
+        push_history(
+            &mut self.gpu_history,
+            snap.gpu.as_ref().and_then(|g| g.utilization_pct).unwrap_or(0.0),
+        );
+        self.push_log(format!(
+            "[{}]  {}",
+            snap.timestamp.format("%H:%M:%S"),
+            snap.summary()
+        ));
+        self.snapshot = Some(snap);
     }
 
     fn push_log(&mut self, msg: String) {
@@ -71,24 +100,39 @@ impl App {
     }
 }
 
+fn push_history(buf: &mut VecDeque<f64>, val: f64) {
+    if buf.len() >= MAX_HISTORY {
+        buf.pop_front();
+    }
+    buf.push_back(val.clamp(0.0, 100.0));
+}
+
+/// Convert a history buffer to chart-ready (x, y) points.
+/// Newest point is always at x = MAX_HISTORY − 1 so the curve slides leftward.
+fn to_points(buf: &VecDeque<f64>) -> Vec<(f64, f64)> {
+    let start_x = (MAX_HISTORY - buf.len()) as f64;
+    buf.iter()
+        .enumerate()
+        .map(|(i, &v)| (start_x + i as f64, v))
+        .collect()
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 pub fn run_tui(config: Config) -> Result<()> {
-    // Restore terminal on panic so the shell isn't left in raw mode
-    let original_hook = std::panic::take_hook();
+    // Restore terminal on panic
+    let orig = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        original_hook(info);
+        orig(info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = run_loop(&mut terminal, config);
 
     disable_raw_mode()?;
@@ -109,19 +153,12 @@ fn run_loop<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     let mut monitor = SystemMonitor::new();
     let mut app = App::new(config);
-    let refresh_interval = Duration::from_secs(REFRESH_SECS);
+    let interval = Duration::from_secs(REFRESH_SECS);
 
     loop {
-        if app.last_refresh.elapsed() >= refresh_interval {
+        if app.last_refresh.elapsed() >= interval {
             match monitor.snapshot() {
-                Ok(snap) => {
-                    app.push_log(format!(
-                        "[{}]  {}",
-                        snap.timestamp.format("%H:%M:%S"),
-                        snap.summary()
-                    ));
-                    app.snapshot = Some(snap);
-                }
+                Ok(snap) => app.ingest_snapshot(snap),
                 Err(e) => app.push_log(format!("[ERROR] {}", e)),
             }
             app.last_refresh = Instant::now();
@@ -129,7 +166,6 @@ fn run_loop<B: ratatui::backend::Backend>(
 
         terminal.draw(|f| render(f, &app))?;
 
-        // Non-blocking key poll — short timeout keeps the refresh ticker alive
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
@@ -140,8 +176,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         return Ok(())
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        // Force immediate refresh on next iteration
-                        app.last_refresh -= refresh_interval;
+                        app.last_refresh -= interval;
                     }
                     KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
                     KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
@@ -157,34 +192,28 @@ fn run_loop<B: ratatui::backend::Backend>(
 fn render(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    // Decide how many lines the CPU-core row needs
-    let core_rows = if app
+    let core_count = app
         .snapshot
         .as_ref()
-        .map(|s| s.cpu.per_core_pct.len() > 4)
-        .unwrap_or(false)
-    {
-        2u16
-    } else {
-        1u16
-    };
-    let processor_height = 2 + 1 + core_rows + 1; // borders + overall + cores + gpu
+        .map(|s| s.cpu.per_core_pct.len())
+        .unwrap_or(0);
+    let core_rows: u16 = if core_count > 8 { 2 } else { 1 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),              // title bar
-            Constraint::Length(processor_height), // processors block
-            Constraint::Length(4),              // memory block
-            Constraint::Min(8),                 // process table
-            Constraint::Length(5),              // activity log
+            Constraint::Length(10),             // 2-D curves
+            Constraint::Length(core_rows + 2),  // per-core gauges (+ block borders)
+            Constraint::Min(7),                 // process table
+            Constraint::Length(4),              // activity log
             Constraint::Length(1),              // footer
         ])
         .split(area);
 
     render_titlebar(f, chunks[0], app);
-    render_processors(f, chunks[1], app);
-    render_memory(f, chunks[2], app);
+    render_charts(f, chunks[1], app);
+    render_cores(f, chunks[2], app);
     render_processes(f, chunks[3], app);
     render_log(f, chunks[4], app);
     render_footer(f, chunks[5]);
@@ -204,7 +233,7 @@ fn render_titlebar(f: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or(("Loading…", Color::DarkGray));
 
-    let thermal_str = app
+    let thermal = app
         .snapshot
         .as_ref()
         .map(|s| match s.thermal_state {
@@ -216,7 +245,7 @@ fn render_titlebar(f: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or("—");
 
-    let updated = app
+    let ts = app
         .snapshot
         .as_ref()
         .map(|s| s.timestamp.format("%H:%M:%S").to_string())
@@ -226,204 +255,228 @@ fn render_titlebar(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 " DeepSpeed ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  Pressure: "),
             Span::styled(
                 pressure_str,
-                Style::default()
-                    .fg(pressure_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(pressure_color).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  Thermal: "),
-            Span::raw(thermal_str),
+            Span::raw(thermal),
             Span::raw(format!(
                 "  │  AI: {}/{}  │  {}",
-                app.config.ai.provider, app.config.ai.model, updated
+                app.config.ai.provider, app.config.ai.model, ts
             )),
         ])),
         area,
     );
 }
 
-// ── Processors block (CPU + per-core + GPU) ────────────────────────────────
+// ── 2-D curve charts ───────────────────────────────────────────────────────
 
-fn render_processors(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Processors ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+fn render_charts(f: &mut Frame, area: Rect, app: &App) {
+    // Decide third panel: GPU utilisation if available, else Swap
+    let has_gpu_util = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.gpu.as_ref())
+        .and_then(|g| g.utilization_pct)
+        .is_some();
 
-    let snap = match &app.snapshot {
-        Some(s) => s,
-        None => return,
-    };
+    let gpu_name = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.gpu.as_ref())
+        .map(|g| g.name.as_str())
+        .unwrap_or("No GPU");
 
-    let core_count = snap.cpu.per_core_pct.len();
-    // Pack up to 8 cores per row; overflow goes to a second row
-    let cores_per_row: usize = 8.min(core_count);
-    let core_rows_needed = if core_count > cores_per_row { 2 } else { 1 };
-
-    let mut constraints = vec![Constraint::Length(1)]; // CPU overall
-    for _ in 0..core_rows_needed {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(1)); // GPU
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner);
-
-    // Overall CPU gauge
-    let cpu_pct = snap.cpu.usage_pct.clamp(0.0, 100.0) as u16;
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color(snap.cpu.usage_pct)))
-            .label(format!(
-                "CPU  {:.1}%  ({} cores)",
-                snap.cpu.usage_pct, snap.cpu.core_count
-            ))
-            .percent(cpu_pct),
-        rows[0],
-    );
-
-    // Per-core row(s)
-    for row_idx in 0..core_rows_needed {
-        let start = row_idx * cores_per_row;
-        let end = (start + cores_per_row).min(core_count);
-        let slice = &snap.cpu.per_core_pct[start..end];
-        if !slice.is_empty() {
-            render_core_row(f, rows[1 + row_idx], slice, start);
-        }
-    }
-
-    // GPU row
-    render_gpu_gauge(f, rows[1 + core_rows_needed], snap.gpu.as_ref());
-}
-
-fn render_core_row(f: &mut Frame, area: Rect, cores: &[f64], offset: usize) {
-    let n = cores.len() as u32;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, n); cores.len()])
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
         .split(area);
 
-    for (i, (&pct, &col)) in cores.iter().zip(cols.iter()).enumerate() {
-        let pct_u16 = pct.clamp(0.0, 100.0) as u16;
-        f.render_widget(
-            Gauge::default()
-                .gauge_style(Style::default().fg(gauge_color(pct)))
-                .label(format!("C{} {:2}%", offset + i, pct_u16))
-                .percent(pct_u16),
-            col,
+    // ── CPU chart ─────────────────────────────────────────────────────────
+    let cpu_data = to_points(&app.cpu_history);
+    let cpu_val = app
+        .snapshot
+        .as_ref()
+        .map(|s| s.cpu.usage_pct)
+        .unwrap_or(0.0);
+    draw_chart(
+        f,
+        cols[0],
+        &format!(" CPU  {:.1}% ", cpu_val),
+        &[(&cpu_data, "CPU", gauge_color(cpu_val))],
+    );
+
+    // ── Memory chart (RAM + Swap overlay) ─────────────────────────────────
+    let mem_data = to_points(&app.mem_history);
+    let swap_data = to_points(&app.swap_history);
+    let mem_val = app
+        .snapshot
+        .as_ref()
+        .map(|s| s.memory.used_pct)
+        .unwrap_or(0.0);
+    let swap_val = app
+        .snapshot
+        .as_ref()
+        .map(|s| s.swap.used_pct)
+        .unwrap_or(0.0);
+    draw_chart(
+        f,
+        cols[1],
+        &format!(" RAM  {:.1}%  Swap  {:.1}% ", mem_val, swap_val),
+        &[
+            (&mem_data, "RAM", gauge_color(mem_val)),
+            (&swap_data, "Swap", Color::Yellow),
+        ],
+    );
+
+    // ── GPU or Swap chart ─────────────────────────────────────────────────
+    if has_gpu_util {
+        let gpu_data = to_points(&app.gpu_history);
+        let gpu_val = app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.gpu.as_ref())
+            .and_then(|g| g.utilization_pct)
+            .unwrap_or(0.0);
+        draw_chart(
+            f,
+            cols[2],
+            &format!(" GPU  {:.1}% ", gpu_val),
+            &[(&gpu_data, "GPU", Color::Magenta)],
+        );
+    } else {
+        // Show GPU name / VRAM info as a placeholder
+        let vram = app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.gpu.as_ref())
+            .and_then(|g| g.vram_total_mb)
+            .map(|v| format!("  {} MB VRAM", v))
+            .unwrap_or_default();
+        let title = format!(" GPU — {}{}  (root req.) ", gpu_name, vram);
+        // Draw swap again so the panel is not empty
+        draw_chart(
+            f,
+            cols[2],
+            &title,
+            &[(&swap_data, "Swap", Color::Yellow)],
         );
     }
 }
 
-fn render_gpu_gauge(f: &mut Frame, area: Rect, gpu: Option<&GpuInfo>) {
-    match gpu {
-        Some(g) => {
-            let (pct_u16, label) = match g.utilization_pct {
-                Some(u) => {
-                    let vram = match (g.vram_used_mb, g.vram_total_mb) {
-                        (Some(used), Some(total)) => format!("  {}/{} MB VRAM", used, total),
-                        (None, Some(total)) => format!("  {} MB VRAM", total),
-                        _ => String::new(),
-                    };
-                    (
-                        u.clamp(0.0, 100.0) as u16,
-                        format!("GPU  {:.1}%  {}{}", u, g.name, vram),
-                    )
-                }
-                None => {
-                    let vram = g
-                        .vram_total_mb
-                        .map(|v| format!("  {} MB VRAM", v))
-                        .unwrap_or_default();
-                    (
-                        0,
-                        format!(
-                            "GPU  N/A  {}{}  (run as root for utilisation)",
-                            g.name, vram
-                        ),
-                    )
-                }
-            };
-            let color = g
-                .utilization_pct
-                .map(gauge_color)
-                .unwrap_or(Color::DarkGray);
-            f.render_widget(
-                Gauge::default()
-                    .gauge_style(Style::default().fg(color))
-                    .label(label)
-                    .percent(pct_u16),
-                area,
-            );
-        }
-        None => {
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    " GPU  —  not detected",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                area,
-            );
-        }
-    }
+/// Draw a single history chart with one or two overlaid curves.
+fn draw_chart(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    series: &[(&Vec<(f64, f64)>, &str, Color)],
+) {
+    let max_x = (MAX_HISTORY - 1) as f64;
+    let total_secs = MAX_HISTORY as u64 * REFRESH_SECS;
+    let half_secs = total_secs / 2;
+
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .map(|(data, name, color)| {
+            Dataset::default()
+                .name(*name)
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(*color))
+                .data(data)
+        })
+        .collect();
+
+    f.render_widget(
+        Chart::new(datasets)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD))),
+            )
+            .x_axis(
+                Axis::default()
+                    .bounds([0.0, max_x])
+                    .style(Style::default().fg(Color::DarkGray))
+                    .labels(vec![
+                        Span::raw(format!("-{}s", total_secs)),
+                        Span::raw(format!("-{}s", half_secs)),
+                        Span::raw("now"),
+                    ]),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, 100.0])
+                    .style(Style::default().fg(Color::DarkGray))
+                    .labels(vec![
+                        Span::raw("  0%"),
+                        Span::raw(" 50%"),
+                        Span::raw("100%"),
+                    ]),
+            ),
+        area,
+    );
 }
 
-// ── Memory block ───────────────────────────────────────────────────────────
+// ── Per-core CPU gauges ────────────────────────────────────────────────────
 
-fn render_memory(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" Memory ");
+fn render_cores(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" CPU Cores ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let snap = match &app.snapshot {
-        Some(s) => s,
-        None => return,
+        Some(s) if !s.cpu.per_core_pct.is_empty() => s,
+        _ => return,
     };
 
+    let cores = &snap.cpu.per_core_pct;
+    let per_row: usize = 8.min(cores.len());
+    let num_rows = if cores.len() > per_row { 2 } else { 1 };
+
+    let row_constraints: Vec<Constraint> =
+        (0..num_rows).map(|_| Constraint::Length(1)).collect();
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints(row_constraints)
         .split(inner);
 
-    // RAM
-    let mem_pct = snap.memory.used_pct.clamp(0.0, 100.0) as u16;
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color(snap.memory.used_pct)))
-            .label(format!(
-                "RAM  {}/{} MB  ({:.1}%)  free: {} MB  kernel: {} MB  cached: {} MB",
-                snap.memory.used_mb,
-                snap.memory.total_mb,
-                snap.memory.used_pct,
-                snap.memory.available_mb,
-                snap.memory.kernel_mb,
-                snap.memory.cached_mb,
-            ))
-            .percent(mem_pct),
-        rows[0],
-    );
+    for (row_idx, row_area) in rows.iter().enumerate() {
+        let start = row_idx * per_row;
+        let end = (start + per_row).min(cores.len());
+        let slice = &cores[start..end];
+        if slice.is_empty() {
+            break;
+        }
+        let n = slice.len() as u32;
+        let col_constraints: Vec<Constraint> =
+            (0..n).map(|_| Constraint::Ratio(1, n)).collect();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(*row_area);
 
-    // Swap — scale color more aggressively (any swap use is notable)
-    let swap_pct = snap.swap.used_pct.clamp(0.0, 100.0) as u16;
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color(snap.swap.used_pct * 1.5)))
-            .label(format!(
-                "Swap {}/{} MB  ({:.1}%)",
-                snap.swap.used_mb, snap.swap.total_mb, snap.swap.used_pct,
-            ))
-            .percent(swap_pct),
-        rows[1],
-    );
+        for (i, (&pct, &col)) in slice.iter().zip(cols.iter()).enumerate() {
+            let pct_u16 = pct.clamp(0.0, 100.0) as u16;
+            f.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().fg(gauge_color(pct)))
+                    .label(format!("C{} {:2}%", start + i, pct_u16))
+                    .percent(pct_u16),
+                col,
+            );
+        }
+    }
 }
 
 // ── Process table ──────────────────────────────────────────────────────────
@@ -480,10 +533,7 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let title = format!(
-        " Processes ({}) — ↑↓ / j k scroll ",
-        snap.top_processes.len()
-    );
+    let title = format!(" Processes ({}) — ↑↓ / j k ", snap.top_processes.len());
     let mut state = TableState::default();
     state.select(Some(app.process_scroll));
 

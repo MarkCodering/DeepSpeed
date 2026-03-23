@@ -2,7 +2,7 @@
 name = "deepspeed"
 version = "0.1.0"
 edition = "2021"
-description = "AI-powered macOS system optimizer for M2/8GB"
+description = "AI-powered system optimizer for macOS, Windows, and Linux."
 authors = ["DeepSpeed"]
 
 [[bin]]

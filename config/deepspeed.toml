@@ -58,12 +58,21 @@ protected_processes = [
 min_process_age_secs = 120
 
 [ai]
-# Your Anthropic API key - or set ANTHROPIC_API_KEY env var
-# Leave empty to run in rule-only mode (no AI)
-api_key = ""
+# Provider: "ollama" (default) or "anthropic"
+provider = "ollama"
 
-# Claude model to use
-model = "claude-haiku-4-5-20251001"
+# Ollama cloud endpoint — or use http://localhost:11434 for local
+ollama_base_url = "https://api.ollama.com"
+
+# Ollama API key — or set OLLAMA_API_KEY env var (required for cloud)
+ollama_api_key = ""
+
+# Model to use
+model = "nemotron-3-super"
+
+# Anthropic API key (only needed when provider = "anthropic")
+# Leave empty or set ANTHROPIC_API_KEY env var
+api_key = ""
 
 # Max tokens for AI response
 max_tokens = 1024
