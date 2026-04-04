@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{CpuRefreshKind, Networks, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemSnapshot {
@@ -14,6 +14,8 @@ pub struct SystemSnapshot {
     pub memory_pressure: MemoryPressureLevel,
     pub thermal_state: ThermalState,
     pub gpu: Option<GpuInfo>,
+    pub network: NetworkInfo,
+    pub load_avg: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,8 @@ pub struct CpuInfo {
     pub usage_pct: f64,
     pub core_count: usize,
     pub per_core_pct: Vec<f64>,
+    /// Current CPU frequency in MHz (0 = unavailable)
+    pub freq_mhz: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +46,14 @@ pub struct GpuInfo {
     pub utilization_pct: Option<f64>,
     pub vram_total_mb: Option<u64>,
     pub vram_used_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// Bytes received per second (all non-loopback interfaces)
+    pub rx_bytes_sec: f64,
+    /// Bytes transmitted per second (all non-loopback interfaces)
+    pub tx_bytes_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +71,8 @@ pub struct ProcessInfo {
     pub cpu_pct: f32,
     pub nice: i32,
     pub run_time_secs: u64,
+    /// Full path to the executable (None for kernel threads or sandboxed processes)
+    pub exe_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +94,8 @@ pub enum ThermalState {
 
 pub struct SystemMonitor {
     sys: System,
+    networks: Networks,
+    net_last_refresh: Instant,
     /// GPU info cached at startup; re-queried every 10 s on platforms with live utilisation
     gpu_cache: Option<GpuInfo>,
     gpu_last_refresh: Instant,
@@ -88,15 +104,30 @@ pub struct SystemMonitor {
 impl SystemMonitor {
     pub fn new() -> Self {
         let sys = System::new_all();
+        let networks = Networks::new_with_refreshed_list();
         let gpu_cache = query_gpu_info();
-        Self { sys, gpu_cache, gpu_last_refresh: Instant::now() }
+        Self {
+            sys,
+            networks,
+            net_last_refresh: Instant::now(),
+            gpu_cache,
+            gpu_last_refresh: Instant::now(),
+        }
     }
 
     pub fn snapshot(&mut self) -> Result<SystemSnapshot> {
-        // Targeted refresh — skip disks, networks, components
+        let net_elapsed = self.net_last_refresh.elapsed().as_secs_f64().max(0.5);
+
+        // Targeted refresh — skip disks, components
         self.sys.refresh_memory();
-        self.sys.refresh_cpu_usage();
+        self.sys.refresh_cpu_specifics(
+            CpuRefreshKind::new().with_cpu_usage().with_frequency(),
+        );
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
+
+        // Network counters: refresh gives bytes-since-last-refresh
+        self.networks.refresh();
+        self.net_last_refresh = Instant::now();
 
         // Re-query GPU every 10 s (picks up live utilisation on Linux/NVIDIA)
         if self.gpu_last_refresh.elapsed().as_secs() >= 10 {
@@ -112,6 +143,10 @@ impl SystemMonitor {
         let top_processes = self.collect_processes();
         let memory_pressure = query_memory_pressure(memory.used_pct);
         let thermal_state = query_thermal_state();
+        let network = self.collect_network(net_elapsed);
+
+        let la = System::load_average();
+        let load_avg = [la.one, la.five, la.fifteen];
 
         Ok(SystemSnapshot {
             timestamp: Utc::now(),
@@ -122,6 +157,8 @@ impl SystemMonitor {
             memory_pressure,
             thermal_state,
             gpu: self.gpu_cache.clone(),
+            network,
+            load_avg,
         })
     }
 
@@ -158,10 +195,13 @@ impl SystemMonitor {
         } else {
             per_core_pct.iter().sum::<f64>() / per_core_pct.len() as f64
         };
+        // frequency() returns MHz; 0 means unavailable
+        let freq_mhz = cpus.first().map(|c| c.frequency()).unwrap_or(0);
         CpuInfo {
             usage_pct,
             core_count: cpus.len(),
             per_core_pct,
+            freq_mhz,
         }
     }
 
@@ -180,7 +220,6 @@ impl SystemMonitor {
 
     fn collect_processes(&self) -> Vec<ProcessInfo> {
         const TOP_N: usize = 20;
-        // Collect cheap (memory, pid, proc) refs, then partial-select top N — O(n) average
         let mut refs: Vec<_> = self.sys.processes().iter().collect();
         if refs.len() > TOP_N {
             refs.select_nth_unstable_by(TOP_N - 1, |a, b| b.1.memory().cmp(&a.1.memory()));
@@ -195,8 +234,22 @@ impl SystemMonitor {
                 cpu_pct: proc.cpu_usage(),
                 nice: 0,
                 run_time_secs: proc.run_time(),
+                exe_path: proc.exe().map(|p| p.to_string_lossy().into_owned()),
             })
             .collect()
+    }
+
+    fn collect_network(&self, elapsed_secs: f64) -> NetworkInfo {
+        let (rx, tx) = self
+            .networks
+            .iter()
+            .filter(|(name, _)| *name != "lo" && *name != "lo0")
+            .map(|(_, n)| (n.received(), n.transmitted()))
+            .fold((0u64, 0u64), |(ar, at), (r, t)| (ar + r, at + t));
+        NetworkInfo {
+            rx_bytes_sec: rx as f64 / elapsed_secs,
+            tx_bytes_sec: tx as f64 / elapsed_secs,
+        }
     }
 }
 
@@ -252,7 +305,6 @@ fn query_extra_mem() -> (u64, u64) {
 
 #[cfg(target_os = "macos")]
 fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
-    // Fast-path: skip the subprocess spawn when clearly below warning threshold
     if used_pct < 70.0 {
         return MemoryPressureLevel::Normal;
     }
@@ -275,7 +327,6 @@ fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
 
 #[cfg(target_os = "linux")]
 fn query_memory_pressure(used_pct: f64) -> MemoryPressureLevel {
-    // Linux Pressure Stall Information (kernel 4.20+)
     let Ok(content) = std::fs::read_to_string("/proc/pressure/memory") else {
         return pressure_from_pct(used_pct);
     };
@@ -339,7 +390,6 @@ fn query_thermal_state() -> ThermalState {
 
 #[cfg(target_os = "linux")]
 fn query_thermal_state() -> ThermalState {
-    // Try the first available thermal zone
     for zone in 0..=4u32 {
         let path = format!("/sys/class/thermal/thermal_zone{}/temp", zone);
         if let Ok(s) = std::fs::read_to_string(&path) {
@@ -360,7 +410,6 @@ fn query_thermal_state() -> ThermalState {
 #[cfg(target_os = "windows")]
 fn query_thermal_state() -> ThermalState {
     use std::process::Command;
-    // MSAcpi_ThermalZoneTemperature returns tenths of Kelvin
     let output = Command::new("wmic")
         .args([
             "/namespace:\\\\root\\wmi",
@@ -422,7 +471,6 @@ fn query_gpu_info() -> Option<GpuInfo> {
 
 #[cfg(target_os = "linux")]
 fn query_gpu_info() -> Option<GpuInfo> {
-    // NVIDIA first, then AMD
     query_nvidia_gpu().or_else(query_amd_gpu)
 }
 
@@ -456,7 +504,6 @@ fn query_amd_gpu() -> Option<GpuInfo> {
         .output()
         .ok()?;
     if !out.status.success() { return None; }
-    // Parse first data row: device,gpu_use_pct,vram_used,vram_total
     for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
         let p: Vec<&str> = line.split(',').map(str::trim).collect();
         if p.len() >= 4 {
@@ -527,7 +574,6 @@ fn parse_colon_u64(line: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn parse_meminfo_kb(line: &str) -> u64 {
-    // "Cached:    123456 kB"
     line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0)
 }
 
@@ -536,14 +582,25 @@ fn parse_meminfo_kb(line: &str) -> u64 {
 impl SystemSnapshot {
     pub fn summary(&self) -> String {
         format!(
-            "Memory: {:.1}% ({}/{}MB) | Swap: {:.1}% ({}MB) | CPU: {:.1}% | Pressure: {:?}",
+            "Memory: {:.1}% ({}/{}MB) | Swap: {:.1}% | CPU: {:.1}% | Load: {:.2} | Net: ↓{}/s ↑{}/s",
             self.memory.used_pct,
             self.memory.used_mb,
             self.memory.total_mb,
             self.swap.used_pct,
-            self.swap.used_mb,
             self.cpu.usage_pct,
-            self.memory_pressure,
+            self.load_avg[0],
+            fmt_bytes(self.network.rx_bytes_sec as u64),
+            fmt_bytes(self.network.tx_bytes_sec as u64),
         )
+    }
+}
+
+pub fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
     }
 }
