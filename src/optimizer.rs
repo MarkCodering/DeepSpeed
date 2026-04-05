@@ -1,6 +1,6 @@
 /// Rule-based optimizer: runs every monitor cycle, zero API cost.
 /// AI engine is only escalated when rules alone can't resolve the situation.
-use crate::actions::{select_renice_candidates, Action, ActionExecutor};
+use crate::actions::{is_protected, select_renice_candidates, Action, ActionExecutor};
 use crate::config::Config;
 use crate::monitor::{MemoryPressureLevel, SystemSnapshot};
 use std::collections::HashMap;
@@ -137,6 +137,37 @@ impl RuleOptimizer {
                 );
                 needs_ai = true;
                 self.ai_escalated = true;
+            }
+        }
+
+        // ── CPU sustained high: lower IO priority of CPU-heavy processes ───
+        if snap.cpu.usage_pct >= _cpu_warn {
+            for proc in &snap.top_processes {
+                if proc.cpu_pct >= 80.0
+                    && proc.run_time_secs >= min_age
+                    && !is_protected(&proc.name, &protected)
+                    && proc.io_priority != "idle"
+                {
+                    let key = format!("ionice:{}", proc.pid);
+                    if self.is_on_cooldown(&key, Duration::from_secs(600)) {
+                        continue;
+                    }
+                    let action = Action::IoNice {
+                        pid: proc.pid,
+                        name: proc.name.clone(),
+                        class: "idle".to_string(),
+                    };
+                    match self.executor.execute(&action) {
+                        Ok(true) => {
+                            let msg = format!("Set IO priority idle for '{}' (cpu={:.1}%, pid {})", proc.name, proc.cpu_pct, proc.pid);
+                            info!("{}", msg);
+                            actions_taken.push(msg);
+                            self.record_action(&key);
+                        }
+                        Ok(false) => {}
+                        Err(e) => warn!("ionice error: {}", e),
+                    }
+                }
             }
         }
 

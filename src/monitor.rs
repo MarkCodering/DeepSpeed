@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use sysinfo::{CpuRefreshKind, Networks, ProcessesToUpdate, System};
@@ -16,6 +17,9 @@ pub struct SystemSnapshot {
     pub gpu: Option<GpuInfo>,
     pub network: NetworkInfo,
     pub load_avg: [f64; 3],
+    pub disk_io: DiskIoInfo,
+    pub total_processes: usize,
+    pub total_threads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +77,24 @@ pub struct ProcessInfo {
     pub run_time_secs: u64,
     /// Full path to the executable (None for kernel threads or sandboxed processes)
     pub exe_path: Option<String>,
+    /// Number of threads in this process (0 if unavailable)
+    pub thread_count: u32,
+    /// Disk read bytes since last refresh (best-effort, 0 on unsupported platforms)
+    pub disk_read_bytes: u64,
+    /// Disk write bytes since last refresh
+    pub disk_write_bytes: u64,
+    /// Virtual memory size in MB
+    pub virtual_memory_mb: u64,
+    /// IO priority class (Linux only: "none", "best-effort", "idle", "realtime")
+    pub io_priority: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiskIoInfo {
+    /// Total bytes read per second across all disks
+    pub read_bytes_sec: f64,
+    /// Total bytes written per second across all disks
+    pub write_bytes_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -99,6 +121,9 @@ pub struct SystemMonitor {
     /// GPU info cached at startup; re-queried every 10 s on platforms with live utilisation
     gpu_cache: Option<GpuInfo>,
     gpu_last_refresh: Instant,
+    /// Previous disk I/O counters for delta calculation
+    prev_disk_read: u64,
+    prev_disk_write: u64,
 }
 
 impl SystemMonitor {
@@ -106,12 +131,15 @@ impl SystemMonitor {
         let sys = System::new_all();
         let networks = Networks::new_with_refreshed_list();
         let gpu_cache = query_gpu_info();
+        let (dr, dw) = read_global_disk_io();
         Self {
             sys,
             networks,
             net_last_refresh: Instant::now(),
             gpu_cache,
             gpu_last_refresh: Instant::now(),
+            prev_disk_read: dr,
+            prev_disk_write: dw,
         }
     }
 
@@ -140,10 +168,11 @@ impl SystemMonitor {
         let memory = self.collect_memory();
         let cpu = self.collect_cpu();
         let swap = self.collect_swap();
-        let top_processes = self.collect_processes();
+        let (top_processes, total_processes, total_threads) = self.collect_processes_extended();
         let memory_pressure = query_memory_pressure(memory.used_pct);
         let thermal_state = query_thermal_state();
         let network = self.collect_network(net_elapsed);
+        let disk_io = self.collect_disk_io(net_elapsed);
 
         let la = System::load_average();
         let load_avg = [la.one, la.five, la.fifteen];
@@ -159,6 +188,9 @@ impl SystemMonitor {
             gpu: self.gpu_cache.clone(),
             network,
             load_avg,
+            disk_io,
+            total_processes,
+            total_threads,
         })
     }
 
@@ -218,25 +250,57 @@ impl SystemMonitor {
         SwapInfo { total_mb, used_mb, used_pct }
     }
 
-    fn collect_processes(&self) -> Vec<ProcessInfo> {
-        const TOP_N: usize = 20;
-        let mut refs: Vec<_> = self.sys.processes().iter().collect();
+    fn collect_processes_extended(&self) -> (Vec<ProcessInfo>, usize, usize) {
+        const TOP_N: usize = 30; // increased from 20 for deeper visibility
+        let all_procs = self.sys.processes();
+        let total_processes = all_procs.len();
+        let total_threads: usize = all_procs.values()
+            .map(|p| p.tasks().map(|t| t.len()).unwrap_or(1))
+            .sum();
+
+        let mut refs: Vec<_> = all_procs.iter().collect();
         if refs.len() > TOP_N {
             refs.select_nth_unstable_by(TOP_N - 1, |a, b| b.1.memory().cmp(&a.1.memory()));
             refs.truncate(TOP_N);
         }
         refs.sort_unstable_by(|a, b| b.1.memory().cmp(&a.1.memory()));
-        refs.into_iter()
-            .map(|(pid, proc)| ProcessInfo {
-                pid: pid.as_u32(),
-                name: proc.name().to_string_lossy().into_owned(),
-                memory_mb: proc.memory() >> 20,
-                cpu_pct: proc.cpu_usage(),
-                nice: 0,
-                run_time_secs: proc.run_time(),
-                exe_path: proc.exe().map(|p| p.to_string_lossy().into_owned()),
+
+        // Use rayon to parallelize the per-process info extraction
+        let procs: Vec<ProcessInfo> = refs
+            .par_iter()
+            .map(|(pid, proc)| {
+                let thread_count = proc.tasks().map(|t| t.len() as u32).unwrap_or(1);
+                let disk_usage = proc.disk_usage();
+                ProcessInfo {
+                    pid: pid.as_u32(),
+                    name: proc.name().to_string_lossy().into_owned(),
+                    memory_mb: proc.memory() >> 20,
+                    cpu_pct: proc.cpu_usage(),
+                    nice: 0,
+                    run_time_secs: proc.run_time(),
+                    exe_path: proc.exe().map(|p| p.to_string_lossy().into_owned()),
+                    thread_count,
+                    disk_read_bytes: disk_usage.read_bytes,
+                    disk_write_bytes: disk_usage.written_bytes,
+                    virtual_memory_mb: proc.virtual_memory() >> 20,
+                    io_priority: query_io_priority(pid.as_u32()),
+                }
             })
-            .collect()
+            .collect();
+
+        (procs, total_processes, total_threads)
+    }
+
+    fn collect_disk_io(&mut self, elapsed_secs: f64) -> DiskIoInfo {
+        let (cur_read, cur_write) = read_global_disk_io();
+        let dr = cur_read.saturating_sub(self.prev_disk_read) as f64 / elapsed_secs;
+        let dw = cur_write.saturating_sub(self.prev_disk_write) as f64 / elapsed_secs;
+        self.prev_disk_read = cur_read;
+        self.prev_disk_write = cur_write;
+        DiskIoInfo {
+            read_bytes_sec: dr,
+            write_bytes_sec: dw,
+        }
     }
 
     fn collect_network(&self, elapsed_secs: f64) -> NetworkInfo {
@@ -577,20 +641,108 @@ fn parse_meminfo_kb(line: &str) -> u64 {
     line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0)
 }
 
+// ── Platform-specific: disk I/O counters ──────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn read_global_disk_io() -> (u64, u64) {
+    let Ok(content) = std::fs::read_to_string("/proc/diskstats") else {
+        return (0, 0);
+    };
+    let mut total_read: u64 = 0;
+    let mut total_write: u64 = 0;
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 14 {
+            let name = parts[2];
+            // Only count whole disks (sda, nvme0n1, vda) not partitions
+            if name.starts_with("sd") && name.len() == 3
+                || name.starts_with("nvme") && name.contains("n") && !name.contains("p")
+                || name.starts_with("vd") && name.len() == 3
+            {
+                // Field 6 = sectors read, field 10 = sectors written (512 bytes each)
+                total_read += parts[5].parse::<u64>().unwrap_or(0) * 512;
+                total_write += parts[9].parse::<u64>().unwrap_or(0) * 512;
+            }
+        }
+    }
+    (total_read, total_write)
+}
+
+#[cfg(target_os = "macos")]
+fn read_global_disk_io() -> (u64, u64) {
+    use std::process::Command;
+    let out = Command::new("iostat").args(["-d", "-c", "1"]).output();
+    let Ok(out) = out else { return (0, 0) };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // iostat output is aggregate KB/s — we approximate total bytes
+    let mut kb_read = 0u64;
+    let mut kb_write = 0u64;
+    for line in text.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            kb_read += parts[parts.len() - 2].parse::<f64>().unwrap_or(0.0) as u64;
+            kb_write += parts[parts.len() - 1].parse::<f64>().unwrap_or(0.0) as u64;
+        }
+    }
+    (kb_read * 1024, kb_write * 1024)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_global_disk_io() -> (u64, u64) {
+    (0, 0)
+}
+
+// ── Platform-specific: per-process IO priority ────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn query_io_priority(pid: u32) -> String {
+    let path = format!("/proc/{}/io", pid);
+    if std::fs::metadata(&path).is_ok() {
+        // ionice class: try reading via ionice command
+        let out = std::process::Command::new("ionice")
+            .args(["-p", &pid.to_string()])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let lower = text.to_lowercase();
+            if lower.contains("idle") {
+                return "idle".to_string();
+            } else if lower.contains("best-effort") || lower.contains("be:") {
+                return "best-effort".to_string();
+            } else if lower.contains("realtime") || lower.contains("rt:") {
+                return "realtime".to_string();
+            } else if lower.contains("none") {
+                return "none".to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_io_priority(_pid: u32) -> String {
+    "n/a".to_string()
+}
+
 // ── Snapshot display ───────────────────────────────────────────────────────
 
 impl SystemSnapshot {
     pub fn summary(&self) -> String {
         format!(
-            "Memory: {:.1}% ({}/{}MB) | Swap: {:.1}% | CPU: {:.1}% | Load: {:.2} | Net: ↓{}/s ↑{}/s",
+            "Mem: {:.1}% ({}/{}MB) | Swap: {:.1}% | CPU: {:.1}% @{}MHz | Load: {:.2} | Net: ↓{}/s ↑{}/s | Disk: R{}/s W{}/s | {}procs/{}thr",
             self.memory.used_pct,
             self.memory.used_mb,
             self.memory.total_mb,
             self.swap.used_pct,
             self.cpu.usage_pct,
+            self.cpu.freq_mhz,
             self.load_avg[0],
             fmt_bytes(self.network.rx_bytes_sec as u64),
             fmt_bytes(self.network.tx_bytes_sec as u64),
+            fmt_bytes(self.disk_io.read_bytes_sec as u64),
+            fmt_bytes(self.disk_io.write_bytes_sec as u64),
+            self.total_processes,
+            self.total_threads,
         )
     }
 }

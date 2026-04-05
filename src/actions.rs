@@ -11,6 +11,8 @@ pub enum Action {
     #[allow(dead_code)]
     KillProcess { pid: u32, name: String },
     Notify { title: String, message: String },
+    /// Set IO scheduling class for a process (Linux: idle, best-effort, realtime)
+    IoNice { pid: u32, name: String, class: String },
 }
 
 pub struct ActionExecutor {
@@ -31,6 +33,7 @@ impl ActionExecutor {
                 self.send_notification(title, message);
                 Ok(true)
             }
+            Action::IoNice { pid, name, class } => ionice_process(*pid, name, class),
         }
     }
 
@@ -152,6 +155,35 @@ fn purge_cache_impl() -> Result<bool> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn purge_cache_impl() -> Result<bool> {
     warn!("Cache purge not supported on this platform");
+    Ok(false)
+}
+
+// ── Platform-specific: IO scheduling ──────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn ionice_process(pid: u32, name: &str, class: &str) -> Result<bool> {
+    // ionice classes: 0=none, 1=realtime, 2=best-effort, 3=idle
+    let class_num = match class {
+        "idle" => "3",
+        "best-effort" => "2",
+        "realtime" => "1",
+        _ => "3", // default to idle for safety
+    };
+    let status = Command::new("ionice")
+        .args(["-c", class_num, "-p", &pid.to_string()])
+        .status()?;
+    if status.success() {
+        info!("Set IO class '{}' for '{}' (pid {})", class, name, pid);
+        Ok(true)
+    } else {
+        warn!("ionice failed for '{}' (pid {})", name, pid);
+        Ok(false)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ionice_process(_pid: u32, name: &str, _class: &str) -> Result<bool> {
+    info!("ionice not available on this platform for '{}'", name);
     Ok(false)
 }
 

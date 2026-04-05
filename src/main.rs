@@ -3,6 +3,7 @@ mod ai_engine;
 mod config;
 mod monitor;
 mod optimizer;
+mod process_intel;
 mod tui;
 
 use anyhow::Result;
