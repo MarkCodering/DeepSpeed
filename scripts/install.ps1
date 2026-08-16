@@ -45,7 +45,7 @@ if (-not (Test-Path "$ConfigDir\deepspeed.toml")) {
     Write-Host "  or set the environment variable: `$env:ANTHROPIC_API_KEY = 'sk-ant-...'"
     Write-Host ""
 } else {
-    Write-Host "Config already exists at $ConfigDir\deepspeed.toml — skipping."
+    Write-Host "Config already exists at $ConfigDir\deepspeed.toml - skipping."
 }
 
 # 4. Install Task Scheduler task
@@ -57,9 +57,9 @@ $LogPath = "$env:LOCALAPPDATA\DeepSpeed\deepspeed.log"
 Write-Host "=== Installation complete ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "Commands:"
-Write-Host "  deepspeed status    — live system snapshot"
-Write-Host "  deepspeed config    — show active configuration"
-Write-Host "  deepspeed install   — reinstall Task Scheduler task"
-Write-Host "  deepspeed uninstall — stop and remove task"
+Write-Host "  deepspeed status    - live system snapshot"
+Write-Host "  deepspeed config    - show active configuration"
+Write-Host "  deepspeed install   - reinstall Task Scheduler task"
+Write-Host "  deepspeed uninstall - stop and remove task"
 Write-Host ""
 Write-Host "Log: $LogPath"
